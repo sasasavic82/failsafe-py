@@ -31,7 +31,19 @@ Implement metrics to support white-box monitoring of the components
 * Provide a standalone library to integrate with [OpenTelemetry](https://opentelemetry.io/) metrics
 * Provide a standalone library to integrate with [Prometheus](https://prometheus.io/) metrics
 
-## M2: Resiliency Workshop App
+## M2: API Framework Integration
+
+**Status**: Ongoing
+
+Integrate with some popular frameworks to provide easy low-code solutions to common problems.
+
+### Goals
+
+* Implement a standalone library to integrate with FastAPI
+* Implement rate limiting middlewares
+* Implement distributed timeouts 
+
+## M3: Resiliency Workshop App
 
 **Status**: Upcoming
 
@@ -51,21 +63,10 @@ Resiliency Workshop App is an example system that uses Failsafe to ensure resili
 * Implement error-rate-based sliding window breaker
 * Implement error-count-based sliding window breaker
 
-## M4: API Framework Integration
-
-**Status**: Future
-
-Integrate with some popular frameworks to provide easy low-code solutions to common problems.
-
-### Goals
-
-* Implement a standalone library to integrate with FastAPI
-* Implement rate limiting middlewares
-* Implement distributed timeouts 
 
 ## MX: Distributed components
 
-**Status**: Distinct Future
+**Status**: Future
 
 Implement a distributed versions of the components based on Redis
 
