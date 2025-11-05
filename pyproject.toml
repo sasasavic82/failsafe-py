@@ -1,5 +1,5 @@
 [project]
-name = "failsafe-py"
+name = "failsafe"
 version = "0.0.1"
 description = "Fault tolerance for resiliency and stability in modern Python applications"
 readme = "README.md"
@@ -30,7 +30,11 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 requires-python = ">=3.12,<4.0"
-dependencies = []
+dependencies = [
+    "PyYAML ~=6.0.3",
+    "fastapi ~=0.120.2",
+    "pydantic ~=2.12.3"
+]
 
 [dependency-groups]
 dev = [
@@ -50,12 +54,12 @@ docs = [
     "mdx-include>=1.4.2,<2.0.0",
     "mkautodoc>=0.2.0,<0.3.0",
     "httpx>=0.23.1,<0.24.0",
-    "fastapi>=0.95.1,<0.96.0",
+    "fastapi~=0.120.2",
 ]
 
 [tool.black]
 line-length = 120
-target-version = ['py312']
+target-version = ['py314']
 
 [tool.ruff]
 line-length = 120
@@ -96,7 +100,7 @@ per-file-ignores = {}
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 # Assume Python 3.12.
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.mccabe]
 max-complexity = 10

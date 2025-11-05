@@ -1,3 +1,7 @@
+"""
+Enhanced RetryManager with dynamic configuration support
+"""
+
 import asyncio
 from typing import Any, Optional
 
@@ -11,6 +15,9 @@ from failsafe.typing import ExceptionsT, FuncT
 
 
 class RetryManager:
+    """
+    Enhanced RetryManager with support for dynamic configuration updates
+    """
 
     def __init__(
         self,
@@ -27,12 +34,53 @@ class RetryManager:
         self._backoff = create_backoff(backoff)
         self._event_dispatcher = event_dispatcher
         self._limiter = limiter
+        
+        # Control plane support
+        self._enabled = True
+        self._original_attempts = attempts
+        self._original_backoff_config = backoff
 
     @property
     def name(self) -> str:
         return self._name
+    
+    @property
+    def enabled(self) -> bool:
+        """Check if this retry pattern is enabled"""
+        return self._enabled
+    
+    def enable(self):
+        """Enable this retry pattern"""
+        self._enabled = True
+    
+    def disable(self):
+        """Disable this retry pattern"""
+        self._enabled = False
+    
+    def update_attempts(self, attempts: AttemptsT):
+        """Dynamically update the number of attempts"""
+        self._attempts = attempts
+    
+    def update_backoff(self, backoff: BackoffsT):
+        """Dynamically update the backoff strategy"""
+        self._backoff = create_backoff(backoff)
+        self._original_backoff_config = backoff
+    
+    def get_config(self) -> dict:
+        """Get current configuration"""
+        return {
+            "name": self._name,
+            "enabled": self._enabled,
+            "attempts": self._attempts,
+            "backoff": self._original_backoff_config,
+            "exceptions": str(self._exceptions),
+        }
 
     async def __call__(self, func: FuncT) -> Any:
+        # If disabled, just execute once
+        if not self._enabled:
+            return await func()
+        
         counter = create_counter(self._attempts)
         backoff_generator = iter(self._backoff)
 
