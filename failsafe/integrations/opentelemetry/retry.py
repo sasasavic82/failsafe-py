@@ -4,7 +4,7 @@ from failsafe.retry.manager import RetryManager
 
 from opentelemetry.metrics import get_meter
 
-from integrations.opentelemetry.__version__ import __version__
+from failsafe.integrations.opentelemetry.__version__ import __version__
 
 
 class RetryMetricListener(RetryListener):

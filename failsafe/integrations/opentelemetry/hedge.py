@@ -5,7 +5,7 @@ from failsafe.hedge.events import HedgeListener
 from failsafe.hedge.manager import HedgeManager
 
 from opentelemetry.metrics import get_meter
-from integrations.opentelemetry.__version__ import __version__
+from failsafe.integrations.opentelemetry.__version__ import __version__
 
 
 class HedgeMetricListener(HedgeListener):

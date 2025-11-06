@@ -3,7 +3,7 @@ from failsafe.bulkhead.manager import BulkheadManager
 from failsafe.bulkhead.events import BulkheadListener
 
 from opentelemetry.metrics import get_meter
-from integrations.opentelemetry.__version__ import __version__
+from failsafe.integrations.opentelemetry.__version__ import __version__
 
 
 class BulkheadMetricListener(BulkheadListener):

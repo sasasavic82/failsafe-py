@@ -3,7 +3,7 @@ from failsafe.failfast.events import FailFastListener
 from failsafe.failfast.manager import FailFastManager
 
 from opentelemetry.metrics import get_meter
-from integrations.opentelemetry.__version__ import __version__
+from failsafe.integrations.opentelemetry.__version__ import __version__
 
 
 class FailFastMetricListener(FailFastListener):

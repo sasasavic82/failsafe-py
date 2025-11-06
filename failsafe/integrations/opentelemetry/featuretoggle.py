@@ -3,7 +3,7 @@ from failsafe.featuretoggle.events import FeatureToggleListener
 from failsafe.featuretoggle.manager import FeatureToggleManager
 
 from opentelemetry.metrics import get_meter
-from integrations.opentelemetry.__version__ import __version__
+from failsafe.integrations.opentelemetry.__version__ import __version__
 
 
 class FeatureToggleMetricListener(FeatureToggleListener):

@@ -5,47 +5,47 @@ from opentelemetry.metrics import Meter, MeterProvider
 # Retry
 from failsafe.retry import register_retry_listener
 from failsafe.retry.manager import RetryManager
-from integrations.opentelemetry.retry import RetryMetricListener
+from failsafe.integrations.opentelemetry.retry import RetryMetricListener
 
 # FailFast
 from failsafe.failfast import register_failfast_listener
 from failsafe.failfast.manager import FailFastManager
-from integrations.opentelemetry.failfast import FailFastMetricListener
+from failsafe.integrations.opentelemetry.failfast import FailFastMetricListener
 
 # FeatureToggle
 from failsafe.featuretoggle import register_featuretoggle_listener
 from failsafe.featuretoggle.manager import FeatureToggleManager
-from integrations.opentelemetry.featuretoggle import FeatureToggleMetricListener
+from failsafe.integrations.opentelemetry.featuretoggle import FeatureToggleMetricListener
 
 # Hedge
 from failsafe.hedge import register_hedge_listener
 from failsafe.hedge.manager import HedgeManager
-from integrations.opentelemetry.hedge import HedgeMetricListener
+from failsafe.integrations.opentelemetry.hedge import HedgeMetricListener
 
 # Cache
 from failsafe.cache.events import register_cache_listener
 from failsafe.cache.manager import CacheManager
-from integrations.opentelemetry.cache import CacheMetricListener
+from failsafe.integrations.opentelemetry.cache import CacheMetricListener
 
 # Bulkhead
 from failsafe.bulkhead.events import register_bulkhead_listener
 from failsafe.bulkhead.manager import BulkheadManager
-from integrations.opentelemetry.bulkhead import BulkheadMetricListener
+from failsafe.integrations.opentelemetry.bulkhead import BulkheadMetricListener
 
 # Circuit Breaker
 from failsafe.circuitbreaker.events import register_breaker_listener
 from failsafe.circuitbreaker.managers import ConsecutiveCircuitBreaker
-from integrations.opentelemetry.circuitbreaker import CircuitBreakerMetricListener
+from failsafe.integrations.opentelemetry.circuitbreaker import CircuitBreakerMetricListener
 
 # Fallback  (events file names the registrar incorrectly; alias it here)
 from failsafe.fallback.events import register_timeout_listener as register_fallback_listener  # noqa: N811
 from failsafe.fallback.manager import FallbackManager
-from integrations.opentelemetry.fallback import FallbackMetricListener
+from failsafe.integrations.opentelemetry.fallback import FallbackMetricListener
 
 # Timeout
 from failsafe.timeout.events import register_timeout_listener
 from failsafe.timeout.manager import TimeoutManager
-from integrations.opentelemetry.timeout import TimeoutMetricListener
+from failsafe.integrations.opentelemetry.timeout import TimeoutMetricListener
 
 ComponentT = TypeVar("ComponentT")
 ListenerT = TypeVar("ListenerT")

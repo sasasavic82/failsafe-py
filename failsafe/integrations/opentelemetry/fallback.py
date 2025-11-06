@@ -5,7 +5,7 @@ from failsafe.fallback.manager import FallbackManager
 from failsafe.fallback.events import FallbackListener
 
 from opentelemetry.metrics import get_meter
-from integrations.opentelemetry.__version__ import __version__
+from failsafe.integrations.opentelemetry.__version__ import __version__
 
 
 class FallbackMetricListener(FallbackListener):
