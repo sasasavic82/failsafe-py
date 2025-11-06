@@ -296,7 +296,10 @@ class RetryControlPlaneListener(ControlPlaneListener):
         await self.collector.set_gauge(self.pattern_type, self.name, "last_attempt_count", counter.current_attempt)
 
 
-class RateLimitControlPlaneListener(ControlPlaneListener):
+
+
+
+class TokenBucketControlPlaneListener(ControlPlaneListener):
     pass
     
 
@@ -586,6 +589,8 @@ def create_control_plane_listener(pattern_type: str, name: str):
     async def listener_factory(component):
         if pattern_type == "retry":
             return RetryControlPlaneListener(pattern_type, name, _METRICS)
+        if pattern_type == "tokenbucket":
+            return TokenBucketControlPlaneListener(pattern_type, name, _METRICS)
         # Add more pattern types as needed
         return ControlPlaneListener(pattern_type, name, _METRICS)
     

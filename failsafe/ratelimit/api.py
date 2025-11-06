@@ -158,6 +158,7 @@ class tokenbucket:
 
         # Register with control plane
         if CONTROL_PLANE_AVAILABLE and enable_control_plane:
+            create_control_plane_listener("tokenbucket", self._component_name)
             register_pattern(
                 pattern_type="ratelimit",
                 name=self._component_name,
