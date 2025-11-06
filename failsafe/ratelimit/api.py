@@ -4,10 +4,10 @@ Enhanced ratelimit API with control plane integration
 
 import functools
 from types import TracebackType
-from typing import Any, Optional, Type, cast, Sequence
-from failsafe.ratelimit.events import _RATELIMIT_LISTENERS, RateLimitListener
-from failsafe.events import get_default_name, EventManager, EventDispatcher
-from failsafe.ratelimit.managers import RateLimiter, TokenBucketLimiter
+from typing import Any, Optional, Type, cast
+from failsafe.events import get_default_name
+from failsafe.ratelimit.managers import RateLimiter
+from failsafe.ratelimit.instrumeted_managers import InstrumentedTokenBucketLimiter
 from failsafe.typing import FuncT
 
 # Import control plane helpers
@@ -123,8 +123,6 @@ class tokenbucket:
         max_executions: Optional[float] = None,
         per_time_secs: Optional[float] = None,
         bucket_size: Optional[float] = None,
-        listeners: Optional[Sequence[RateLimitListener]] = None,
-        event_manager: Optional["EventManager"] = None,
         name: Optional[str] = None,
         enable_control_plane: bool = True,
         func: Optional[FuncT] = None,  # For internal use when used as decorator
@@ -152,29 +150,12 @@ class tokenbucket:
             else config.get("bucket_size", None)
         )
 
-        # Add control plane listener if available
-        local_listeners = list(listeners) if listeners else []
-        if CONTROL_PLANE_AVAILABLE and enable_control_plane:
-            cp_listener = create_control_plane_listener("tokenbucket", self._component_name)
-            if cp_listener:
-                local_listeners.append(cp_listener)
-        
-        event_dispatcher = EventDispatcher[TokenBucketLimiter, RateLimitListener](
-            local_listeners,
-            _RATELIMIT_LISTENERS,
-            event_manager=event_manager
-        )
-
-        self._limiter = TokenBucketLimiter(
+        self._limiter = InstrumentedTokenBucketLimiter(
             max_executions=final_max_executions,
             per_time_secs=final_per_time_secs,
             bucket_size=final_bucket_size,
-            event_dispatcher=event_dispatcher.as_listener
         )
 
-        event_dispatcher.set_component(self._limiter)
-
-        
         # Register with control plane
         if CONTROL_PLANE_AVAILABLE and enable_control_plane:
             register_pattern(

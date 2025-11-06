@@ -6,7 +6,7 @@ from typing import Optional
 
 from failsafe.ratelimit.buckets import TokenBucket
 from failsafe.ratelimit.exceptions import EmptyBucket, RateLimitExceeded
-from failsafe.ratelimit.events import RateLimitListener
+
 
 class RateLimiter:
     """Base rate limiter with control plane support"""
@@ -49,7 +49,6 @@ class TokenBucketLimiter(RateLimiter):
         self,
         max_executions: float,
         per_time_secs: float,
-        event_dispatcher: RateLimitListener,
         bucket_size: Optional[float] = None
     ) -> None:
         super().__init__()
@@ -57,7 +56,6 @@ class TokenBucketLimiter(RateLimiter):
         self._max_executions = max_executions
         self._per_time_secs = per_time_secs
         self._bucket_size = bucket_size if bucket_size else max_executions
-        self._event_dispatcher = event_dispatcher
         
         # Lazy initialization - create bucket when first accessed
         self._token_bucket: Optional[TokenBucket] = None
@@ -162,11 +160,8 @@ class TokenBucketLimiter(RateLimiter):
             return
         
         try:
-            await self._event_dispatcher.on_request(self)
             await self.bucket.take()  # Use lazy property instead of _token_bucket directly
-            await self._event_dispatcher.on_success(self)
         except EmptyBucket as e:
-            await self._event_dispatcher.on_failure(self)
             raise RateLimitExceeded from e
 
 
