@@ -354,7 +354,7 @@ class FailsafeController:
         """Register all control plane API routes"""
         
         # Health and liveness endpoints
-        @self.app.get(f"{self.prefix}/health", response_model=HealthResponse)
+        @self.app.get(f"{self.prefix}/health", response_model=HealthResponse, tags=["failsafe"])
         async def health():
             """Health check endpoint"""
             patterns = self.registry.get_all_patterns()
@@ -364,13 +364,13 @@ class FailsafeController:
                 patterns_active=len(patterns)
             )
         
-        @self.app.get(f"{self.prefix}/liveness")
+        @self.app.get(f"{self.prefix}/liveness", tags=["failsafe"])
         async def liveness():
             """Simple liveness check (ping)"""
             return {"status": "alive", "timestamp": datetime.utcnow().isoformat()}
         
         # Pattern discovery
-        @self.app.get(f"{self.prefix}/patterns")
+        @self.app.get(f"{self.prefix}/patterns", tags=["failsafe"])
         async def list_patterns(pattern_type: Optional[str] = None):
             """List all registered patterns"""
             if pattern_type:
@@ -385,7 +385,7 @@ class FailsafeController:
         
         # Configuration management
         if self.enable_control:
-            @self.app.get(f"{self.prefix}/config/{{pattern_type}}/{{name}}")
+            @self.app.get(f"{self.prefix}/config/{{pattern_type}}/{{name}}", tags=["failsafe"])
             async def get_config(pattern_type: str, name: str):
                 """Get configuration for a specific pattern"""
                 config = self.config_manager.get_pattern_config(pattern_type, name)
@@ -401,7 +401,7 @@ class FailsafeController:
                     "timestamp": datetime.utcnow().isoformat()
                 }
             
-            @self.app.put(f"{self.prefix}/config/{{pattern_type}}/{{name}}")
+            @self.app.put(f"{self.prefix}/config/{{pattern_type}}/{{name}}", tags=["failsafe"])
             async def update_config(pattern_type: str, name: str, config: Dict[str, Any]):
                 """Update configuration for a specific pattern"""
                 # Validate pattern exists
@@ -426,7 +426,7 @@ class FailsafeController:
                     "timestamp": datetime.utcnow().isoformat()
                 }
             
-            @self.app.get(f"{self.prefix}/config")
+            @self.app.get(f"{self.prefix}/config", tags=["failsafe"])
             async def get_all_configs():
                 """Get all configurations"""
                 return {
@@ -437,7 +437,7 @@ class FailsafeController:
         
         # Metrics endpoints
         if self.enable_metrics:
-            @self.app.get(f"{self.prefix}/metrics/{{pattern_type}}/{{name}}", response_model=MetricsResponse)
+            @self.app.get(f"{self.prefix}/metrics/{{pattern_type}}/{{name}}", response_model=MetricsResponse, tags=["failsafe"])
             async def get_metrics(pattern_type: str, name: str):
                 """Get metrics for a specific pattern"""
                 metrics = self.metrics.get_metrics(pattern_type, name)
@@ -454,7 +454,7 @@ class FailsafeController:
                     timestamp=datetime.utcnow().isoformat()
                 )
             
-            @self.app.get(f"{self.prefix}/metrics")
+            @self.app.get(f"{self.prefix}/metrics", tags=["failsafe"])
             async def get_all_metrics():
                 """Get all metrics"""
                 all_metrics = self.metrics.get_all_metrics()
@@ -463,7 +463,7 @@ class FailsafeController:
                     "timestamp": datetime.utcnow().isoformat()
                 }
             
-            @self.app.delete(f"{self.prefix}/metrics/{{pattern_type}}/{{name}}")
+            @self.app.delete(f"{self.prefix}/metrics/{{pattern_type}}/{{name}}", tags=["failsafe"])
             async def reset_metrics(pattern_type: str, name: str):
                 """Reset metrics for a specific pattern"""
                 self.metrics.reset_metrics(pattern_type, name)
@@ -476,7 +476,7 @@ class FailsafeController:
         
         # Pattern control endpoints
         if self.enable_control:
-            @self.app.post(f"{self.prefix}/control/{{pattern_type}}/{{name}}/enable")
+            @self.app.post(f"{self.prefix}/control/{{pattern_type}}/{{name}}/enable", tags=["failsafe"])
             async def enable_pattern(pattern_type: str, name: str):
                 """Enable a specific pattern"""
                 pattern = self.registry.get_pattern(pattern_type, name)
@@ -497,7 +497,7 @@ class FailsafeController:
                     "timestamp": datetime.utcnow().isoformat()
                 }
             
-            @self.app.post(f"{self.prefix}/control/{{pattern_type}}/{{name}}/disable")
+            @self.app.post(f"{self.prefix}/control/{{pattern_type}}/{{name}}/disable", tags=["failsafe"])
             async def disable_pattern(pattern_type: str, name: str):
                 """Disable a specific pattern"""
                 pattern = self.registry.get_pattern(pattern_type, name)
