@@ -62,6 +62,13 @@ class TokenBucketLimiter(RateLimiter):
 
     @property
     def bucket(self) -> TokenBucket:
+        """Lazy initialization of token bucket"""
+        if self._token_bucket is None:
+            self._token_bucket = TokenBucket(
+                max_executions=self._max_executions,
+                per_time_secs=self._per_time_secs,
+                bucket_size=self._bucket_size
+            )
         return self._token_bucket
 
     @property
@@ -81,8 +88,8 @@ class TokenBucketLimiter(RateLimiter):
     
     @property
     def current_tokens(self) -> float:
-        """Get current available tokens"""
-        return self._token_bucket.tokens
+        """Get current available tokens (lazy init)"""
+        return self.bucket.tokens
     
     def update_max_executions(self, max_executions: float):
         """
@@ -90,11 +97,8 @@ class TokenBucketLimiter(RateLimiter):
         Note: This creates a new token bucket with the updated rate.
         """
         self._max_executions = max_executions
-        self._token_bucket = TokenBucket(
-            max_executions=self._max_executions,
-            per_time_secs=self._per_time_secs,
-            bucket_size=self._bucket_size
-        )
+        # Force recreation on next access
+        self._token_bucket = None
     
     def update_per_time_secs(self, per_time_secs: float):
         """
@@ -102,11 +106,8 @@ class TokenBucketLimiter(RateLimiter):
         Note: This creates a new token bucket with the updated window.
         """
         self._per_time_secs = per_time_secs
-        self._token_bucket = TokenBucket(
-            max_executions=self._max_executions,
-            per_time_secs=self._per_time_secs,
-            bucket_size=self._bucket_size
-        )
+        # Force recreation on next access
+        self._token_bucket = None
     
     def update_bucket_size(self, bucket_size: float):
         """
@@ -114,11 +115,8 @@ class TokenBucketLimiter(RateLimiter):
         Note: This creates a new token bucket with the updated size.
         """
         self._bucket_size = bucket_size
-        self._token_bucket = TokenBucket(
-            max_executions=self._max_executions,
-            per_time_secs=self._per_time_secs,
-            bucket_size=self._bucket_size
-        )
+        # Force recreation on next access
+        self._token_bucket = None
     
     def update_config(
         self,
@@ -139,12 +137,8 @@ class TokenBucketLimiter(RateLimiter):
         if bucket_size is not None:
             self._bucket_size = bucket_size
         
-        # Recreate token bucket with new config
-        self._token_bucket = TokenBucket(
-            max_executions=self._max_executions,
-            per_time_secs=self._per_time_secs,
-            bucket_size=self._bucket_size
-        )
+        # Force recreation on next access
+        self._token_bucket = None
     
     def get_config(self) -> dict:
         """Get current configuration"""
@@ -166,7 +160,7 @@ class TokenBucketLimiter(RateLimiter):
             return
         
         try:
-            await self._token_bucket.take()
+            await self.bucket.take()  # Use lazy property instead of _token_bucket directly
         except EmptyBucket as e:
             raise RateLimitExceeded from e
 

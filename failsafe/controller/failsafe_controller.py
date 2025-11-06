@@ -296,6 +296,10 @@ class RetryControlPlaneListener(ControlPlaneListener):
         await self.collector.set_gauge(self.pattern_type, self.name, "last_attempt_count", counter.current_attempt)
 
 
+class RateLimitControlPlaneListener(ControlPlaneListener):
+    pass
+    
+
 # ============================================================================
 # FailsafeController - Main Controller Class
 # ============================================================================

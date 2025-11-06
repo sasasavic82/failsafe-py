@@ -175,7 +175,7 @@ class tokenbucket:
         if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
             return self
         
-        await self._limiter.acquire()
+        await self._limiter.acquire()  # Uses lazy bucket property internally
         return self
 
     async def __aexit__(
