@@ -6,6 +6,12 @@ from typing import Optional
 
 from failsafe.ratelimit.buckets import TokenBucket
 from failsafe.ratelimit.exceptions import EmptyBucket, RateLimitExceeded
+from failsafe.ratelimit.retry_after import (
+    RetryAfterStrategy,
+    RetryAfterCalculator,
+    create_calculator,
+    DEFAULT_CALCULATOR
+)
 
 
 class RateLimiter:
@@ -40,22 +46,34 @@ class RateLimiter:
 
 class TokenBucketLimiter(RateLimiter):
     """
-    Token Bucket Rate Limiter with dynamic configuration support.
+    Token Bucket Rate Limiter with dynamic configuration support and Retry-After calculation.
     Replenish tokens as time passes on. If tokens are available, executions can be allowed.
-    Otherwise, it's going to be rejected with RateLimitExceeded
+    Otherwise, it's going to be rejected with RateLimitExceeded including Retry-After guidance.
     """
 
     def __init__(
         self,
         max_executions: float,
         per_time_secs: float,
-        bucket_size: Optional[float] = None
+        bucket_size: Optional[float] = None,
+        retry_after_strategy: RetryAfterStrategy = RetryAfterStrategy.UTILIZATION,
+        retry_after_calculator: Optional[RetryAfterCalculator] = None,
+        **calculator_kwargs,
     ) -> None:
         super().__init__()
         
         self._max_executions = max_executions
         self._per_time_secs = per_time_secs
         self._bucket_size = bucket_size if bucket_size else max_executions
+        
+        # Retry-After calculation strategy
+        self._retry_after_calculator = (
+            retry_after_calculator or 
+            create_calculator(retry_after_strategy, **calculator_kwargs)
+        )
+        
+        # Track rejections for exponential backoff (if using that strategy)
+        self._rejection_count = 0
         
         # Lazy initialization - create bucket when first accessed
         self._token_bucket: Optional[TokenBucket] = None
@@ -153,16 +171,54 @@ class TokenBucketLimiter(RateLimiter):
     async def acquire(self) -> None:
         """
         Acquire a token from the bucket.
-        Raises RateLimitExceeded if bucket is empty and not enough time has passed.
+        Raises RateLimitExceeded with Retry-After if bucket is empty.
         """
         # If disabled, allow through without rate limiting
         if not self._enabled:
             return
         
         try:
-            await self.bucket.take()  # Use lazy property instead of _token_bucket directly
+            await self.bucket.take()
+            # Success - reset rejection count
+            self._rejection_count = 0
+        
         except EmptyBucket as e:
-            raise RateLimitExceeded from e
+            # Calculate retry-after based on strategy
+            retry_after_ms = self._calculate_retry_after()
+            
+            # Increment rejection count for exponential backoff
+            self._rejection_count += 1
+            
+            # Raise with retry-after guidance
+            raise RateLimitExceeded(
+                retry_after_ms=retry_after_ms,
+                message=f"Rate limit exceeded. Retry after {retry_after_ms:.0f}ms"
+            ) from e
+    
+    def _calculate_retry_after(self) -> float:
+        """Calculate retry-after time in milliseconds"""
+        bucket = self.bucket
+        
+        # Get current state
+        current_tokens = bucket.tokens
+        token_rate = self._max_executions / self._per_time_secs  # tokens per second
+        
+        # Calculate time until next token
+        import asyncio
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        time_until_next = max(0, bucket._next_replenish_at - now)
+        
+        # Use calculator to determine wait time
+        retry_after_ms = self._retry_after_calculator.calculate(
+            current_tokens=current_tokens,
+            bucket_size=self._bucket_size,
+            token_rate=token_rate,
+            time_until_next=time_until_next,
+            rejection_count=self._rejection_count,
+        )
+        
+        return retry_after_ms
 
 
 class LeakyTokenBucketLimiter(RateLimiter):

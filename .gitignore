@@ -14,3 +14,4 @@ tmp
 __pycache__
 .ipynb_checkpoints
 .DS_Store
+.git-credentials

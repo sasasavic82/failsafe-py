@@ -6,6 +6,7 @@ from typing import Optional
 
 from failsafe.ratelimit.managers import TokenBucketLimiter
 from failsafe.ratelimit.exceptions import RateLimitExceeded
+from failsafe.ratelimit.retry_after import RetryAfterStrategy, RetryAfterCalculator
 
 # Try to import metrics collector
 try:
@@ -28,8 +29,19 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
         per_time_secs: float,
         bucket_size: Optional[float] = None,
         pattern_name: Optional[str] = None,
+        retry_after_strategy: RetryAfterStrategy = RetryAfterStrategy.UTILIZATION,
+        retry_after_calculator: Optional[RetryAfterCalculator] = None,
+        **calculator_kwargs,
     ) -> None:
-        super().__init__(max_executions, per_time_secs, bucket_size)
+        # Pass retry-after parameters to parent
+        super().__init__(
+            max_executions=max_executions,
+            per_time_secs=per_time_secs,
+            bucket_size=bucket_size,
+            retry_after_strategy=retry_after_strategy,
+            retry_after_calculator=retry_after_calculator,
+            **calculator_kwargs,
+        )
         self._pattern_name = pattern_name or "ratelimit"
     
     async def acquire(self) -> None:
