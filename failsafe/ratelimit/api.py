@@ -5,9 +5,11 @@ Enhanced ratelimit API with control plane integration
 import functools
 from types import TracebackType
 from typing import Any, Optional, Type, cast
+
 from failsafe.events import get_default_name
 from failsafe.ratelimit.managers import RateLimiter
 from failsafe.ratelimit.instrumeted_managers import InstrumentedTokenBucketLimiter
+from failsafe.ratelimit.retry_after import RetryAfterStrategy, RetryAfterCalculator
 from failsafe.typing import FuncT
 
 # Import control plane helpers
@@ -115,7 +117,17 @@ class tokenbucket:
         The burst is when no executions have happened for a long time, and then you are receiving a
         bunch of them at the same time. Equal to *max_executions* by default.
     * **name** *(None | str)* - A component name or ID (will be passed to listeners and metrics)
+    * **retry_after_strategy** *(RetryAfterStrategy | str)* - Strategy for calculating Retry-After
+        Options: 'fixed', 'utilization', 'adaptive', 'jittered', 'exponential', 'proportional'
+        Default: 'utilization' (adaptive, prevents bucket depletion)
+    * **retry_after_calculator** *(RetryAfterCalculator | None)* - Custom calculator (advanced)
     * **enable_control_plane** *(bool)* - Enable control plane integration (default: True)
+    * **aggressive_threshold** *(float)* - For utilization strategy: threshold for aggressive backoff (default: 0.2)
+    * **warning_threshold** *(float)* - For utilization strategy: threshold for warning (default: 0.5)
+    * **normal_threshold** *(float)* - For utilization strategy: threshold for normal operation (default: 0.8)
+    * **jitter_range_ms** *(float)* - For jittered strategy: max jitter in milliseconds (default: 1000)
+    * **backoff_factor** *(float)* - For exponential strategy: backoff multiplier (default: 2.0)
+    * **max_backoff_ms** *(float)* - For exponential strategy: max backoff in milliseconds (default: 60000)
     """
 
     def __init__(
@@ -124,8 +136,17 @@ class tokenbucket:
         per_time_secs: Optional[float] = None,
         bucket_size: Optional[float] = None,
         name: Optional[str] = None,
+        retry_after_strategy: Optional[RetryAfterStrategy] = None,
+        retry_after_calculator: Optional[RetryAfterCalculator] = None,
         enable_control_plane: bool = True,
         func: Optional[FuncT] = None,  # For internal use when used as decorator
+        # Strategy-specific parameters
+        aggressive_threshold: Optional[float] = None,
+        warning_threshold: Optional[float] = None,
+        normal_threshold: Optional[float] = None,
+        jitter_range_ms: Optional[float] = None,
+        backoff_factor: Optional[float] = None,
+        max_backoff_ms: Optional[float] = None,
     ) -> None:
         # Determine component name
         self._component_name = name or get_default_name(func) if func else "tokenbucket"
@@ -149,11 +170,36 @@ class tokenbucket:
             bucket_size if bucket_size is not None 
             else config.get("bucket_size", None)
         )
+        
+        # Retry-After strategy configuration
+        final_strategy = (
+            retry_after_strategy if retry_after_strategy is not None
+            else config.get("retry_after_strategy", RetryAfterStrategy.UTILIZATION)
+        )
+        
+        # Build strategy-specific kwargs
+        strategy_kwargs = {}
+        if aggressive_threshold is not None:
+            strategy_kwargs['aggressive_threshold'] = aggressive_threshold
+        if warning_threshold is not None:
+            strategy_kwargs['warning_threshold'] = warning_threshold
+        if normal_threshold is not None:
+            strategy_kwargs['normal_threshold'] = normal_threshold
+        if jitter_range_ms is not None:
+            strategy_kwargs['jitter_range_ms'] = jitter_range_ms
+        if backoff_factor is not None:
+            strategy_kwargs['backoff_factor'] = backoff_factor
+        if max_backoff_ms is not None:
+            strategy_kwargs['max_backoff_ms'] = max_backoff_ms
 
+        # Create the limiter with retry-after strategy
         self._limiter = InstrumentedTokenBucketLimiter(
             max_executions=final_max_executions,
             per_time_secs=final_per_time_secs,
             bucket_size=final_bucket_size,
+            retry_after_strategy=final_strategy,
+            retry_after_calculator=retry_after_calculator,
+            **strategy_kwargs,
         )
 
         # Register with control plane
