@@ -1,15 +1,16 @@
 """
-Enhanced ratelimit API with control plane integration
+Enhanced ratelimit API with control plane integration and backpressure
 """
 
 import functools
+import time
 from types import TracebackType
 from typing import Any, Optional, Type, cast
 
 from failsafe.events import get_default_name
 from failsafe.ratelimit.managers import RateLimiter
 from failsafe.ratelimit.instrumeted_managers import InstrumentedTokenBucketLimiter
-from failsafe.ratelimit.retry_after import RetryAfterStrategy, RetryAfterCalculator
+from failsafe.ratelimit.retry_after import RetryAfterStrategy, RetryAfterCalculator, BackpressureCalculator
 from failsafe.typing import FuncT
 
 # Import control plane helpers
@@ -118,13 +119,26 @@ class tokenbucket:
         bunch of them at the same time. Equal to *max_executions* by default.
     * **name** *(None | str)* - A component name or ID (will be passed to listeners and metrics)
     * **retry_after_strategy** *(RetryAfterStrategy | str)* - Strategy for calculating Retry-After
-        Options: 'fixed', 'utilization', 'adaptive', 'jittered', 'exponential', 'proportional'
-        Default: 'utilization' (adaptive, prevents bucket depletion)
+        Options: 'backpressure', 'fixed', 'utilization', 'adaptive', 'jittered', 'exponential', 'proportional'
+        Default: 'backpressure' (hybrid P95 + latency gradient monitoring)
     * **retry_after_calculator** *(RetryAfterCalculator | None)* - Custom calculator (advanced)
     * **enable_control_plane** *(bool)* - Enable control plane integration (default: True)
+    * **track_latency** *(bool)* - Enable automatic latency tracking for backpressure (default: True)
+    
+    **Backpressure Strategy Parameters:**
+    * **window_size** *(int)* - Number of recent requests to track (default: 100)
+    * **p95_baseline** *(float)* - Healthy P95 latency SLO in seconds (default: 0.2)
+    * **min_latency** *(float)* - Minimum processing time in seconds (default: 0.05)
+    * **min_retry_delay** *(float)* - Base retry delay in seconds (default: 1.0)
+    * **max_retry_penalty** *(float)* - Max additional penalty in seconds (default: 15.0)
+    * **gradient_sensitivity** *(float)* - How quickly gradient responds (default: 2.0)
+    
+    **Utilization Strategy Parameters:**
     * **aggressive_threshold** *(float)* - For utilization strategy: threshold for aggressive backoff (default: 0.2)
     * **warning_threshold** *(float)* - For utilization strategy: threshold for warning (default: 0.5)
     * **normal_threshold** *(float)* - For utilization strategy: threshold for normal operation (default: 0.8)
+    
+    **Other Strategy Parameters:**
     * **jitter_range_ms** *(float)* - For jittered strategy: max jitter in milliseconds (default: 1000)
     * **backoff_factor** *(float)* - For exponential strategy: backoff multiplier (default: 2.0)
     * **max_backoff_ms** *(float)* - For exponential strategy: max backoff in milliseconds (default: 60000)
@@ -139,11 +153,20 @@ class tokenbucket:
         retry_after_strategy: Optional[RetryAfterStrategy] = None,
         retry_after_calculator: Optional[RetryAfterCalculator] = None,
         enable_control_plane: bool = True,
+        track_latency: bool = True,
         func: Optional[FuncT] = None,  # For internal use when used as decorator
-        # Strategy-specific parameters
+        # Backpressure strategy parameters
+        window_size: Optional[int] = None,
+        p95_baseline: Optional[float] = None,
+        min_latency: Optional[float] = None,
+        min_retry_delay: Optional[float] = None,
+        max_retry_penalty: Optional[float] = None,
+        gradient_sensitivity: Optional[float] = None,
+        # Utilization strategy parameters
         aggressive_threshold: Optional[float] = None,
         warning_threshold: Optional[float] = None,
         normal_threshold: Optional[float] = None,
+        # Other strategy parameters
         jitter_range_ms: Optional[float] = None,
         backoff_factor: Optional[float] = None,
         max_backoff_ms: Optional[float] = None,
@@ -151,6 +174,7 @@ class tokenbucket:
         # Determine component name
         self._component_name = name or get_default_name(func) if func else "tokenbucket"
         self._enable_control_plane = enable_control_plane
+        self._track_latency = track_latency
         
         # Check for configuration from control plane
         config = {}
@@ -171,20 +195,38 @@ class tokenbucket:
             else config.get("bucket_size", None)
         )
         
-        # Retry-After strategy configuration
+        # Retry-After strategy configuration (default to BACKPRESSURE)
         final_strategy = (
             retry_after_strategy if retry_after_strategy is not None
-            else config.get("retry_after_strategy", RetryAfterStrategy.UTILIZATION)
+            else config.get("retry_after_strategy", RetryAfterStrategy.BACKPRESSURE)
         )
         
         # Build strategy-specific kwargs
         strategy_kwargs = {}
+        
+        # Backpressure parameters
+        if window_size is not None:
+            strategy_kwargs['window_size'] = window_size
+        if p95_baseline is not None:
+            strategy_kwargs['p95_baseline'] = p95_baseline
+        if min_latency is not None:
+            strategy_kwargs['min_latency'] = min_latency
+        if min_retry_delay is not None:
+            strategy_kwargs['min_retry_delay'] = min_retry_delay
+        if max_retry_penalty is not None:
+            strategy_kwargs['max_retry_penalty'] = max_retry_penalty
+        if gradient_sensitivity is not None:
+            strategy_kwargs['gradient_sensitivity'] = gradient_sensitivity
+        
+        # Utilization parameters
         if aggressive_threshold is not None:
             strategy_kwargs['aggressive_threshold'] = aggressive_threshold
         if warning_threshold is not None:
             strategy_kwargs['warning_threshold'] = warning_threshold
         if normal_threshold is not None:
             strategy_kwargs['normal_threshold'] = normal_threshold
+        
+        # Other parameters
         if jitter_range_ms is not None:
             strategy_kwargs['jitter_range_ms'] = jitter_range_ms
         if backoff_factor is not None:
@@ -214,6 +256,7 @@ class tokenbucket:
                     "per_time_secs": final_per_time_secs,
                     "bucket_size": final_bucket_size or final_max_executions,
                     "function": func.__qualname__ if func and hasattr(func, '__qualname__') else None,
+                    "retry_after_strategy": str(final_strategy),
                 }
             )
 
@@ -235,7 +278,7 @@ class tokenbucket:
 
     def __call__(self, func: FuncT) -> FuncT:
         """
-        Apply ratelimiter as a decorator
+        Apply ratelimiter as a decorator with automatic latency tracking
         """
         
         # If name wasn't provided in __init__, use function name
@@ -259,10 +302,36 @@ class tokenbucket:
             if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
                 return await func(*args, **kwargs)
             
+            # Acquire rate limit
             await self._limiter.acquire()
-            return await func(*args, **kwargs)
+            
+            # Track latency if enabled and using backpressure calculator
+            if self._track_latency:
+                start_time = time.perf_counter()
+                try:
+                    result = await func(*args, **kwargs)
+                    return result
+                finally:
+                    # Record latency in backpressure calculator
+                    latency_seconds = time.perf_counter() - start_time
+                    if isinstance(self._limiter._retry_after_calculator, BackpressureCalculator):
+                        self._limiter._retry_after_calculator.record_latency(latency_seconds)
+            else:
+                return await func(*args, **kwargs)
 
         _wrapper._original = func  # type: ignore[attr-defined]
         _wrapper._manager = self._limiter  # type: ignore[attr-defined]
 
         return cast(FuncT, _wrapper)
+    
+    def get_backpressure(self) -> Optional[float]:
+        """
+        Get current backpressure score (0.0 to 1.0)
+        
+        Returns None if not using backpressure strategy.
+        Use this to populate X-Backpressure header.
+        """
+        calc = getattr(self._limiter, '_retry_after_calculator', None)
+        if isinstance(calc, BackpressureCalculator):
+            return calc.get_backpressure_header()
+        return None

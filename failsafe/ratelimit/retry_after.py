@@ -5,18 +5,22 @@ Implements various strategies for calculating how long a client should wait
 before retrying when rate limited.
 """
 
+import math
 import random
+import statistics
 from abc import ABC, abstractmethod
+from collections import deque
 from enum import Enum
 from typing import Optional
 
 
 class RetryAfterStrategy(str, Enum):
     """Available retry-after calculation strategies"""
+    BACKPRESSURE = "backpressure"      # Hybrid P95 + Gradient backpressure (DEFAULT)
     FIXED = "fixed"                    # Wait until next token available
     ADAPTIVE = "adaptive"              # Alias for utilization
     UTILIZATION = "utilization"        # Based on bucket fill level (prevents depletion)
-    JITTERED = "jittered"             # Fixed + random jitter (prevents thundering herd)
+    JITTERED = "jittered"              # Fixed + random jitter (prevents thundering herd)
     EXPONENTIAL = "exponential"        # Exponential backoff for repeated violations
     PROPORTIONAL = "proportional"      # Proportional to remaining capacity
 
@@ -40,6 +44,159 @@ class RetryAfterCalculator(ABC):
             Milliseconds to wait before retrying
         """
         pass
+
+
+class BackpressureCalculator(RetryAfterCalculator):
+    """
+    Hybrid Backpressure strategy: Combines P95 violation detection with latency gradient
+    
+    This is an adaptive system that calculates backpressure from two independent dimensions:
+    1. Service Quality (P95 Violation): Ensures service never normalizes poor performance
+    2. Queue Congestion (Latency Gradient): Leading indicator of resource saturation
+    
+    Final backpressure = max(BP_P95, BP_Gradient)
+    
+    The backpressure score (0.0 to 1.0) is then used to calculate Retry-After with jitter.
+    
+    Pros:
+    - Proactive queue congestion detection (leading indicator)
+    - Maintains SLO compliance (never normalizes degradation)
+    - Self-regulating under load
+    - Prevents thundering herd via jitter
+    
+    Cons:
+    - Requires latency tracking overhead
+    - More complex than simple strategies
+    """
+    
+    def __init__(
+        self,
+        window_size: int = 100,
+        p95_baseline: float = 0.2,  # 200ms healthy P95 SLO
+        min_latency: float = 0.05,  # 50ms minimum processing time
+        min_retry_delay: float = 1.0,  # Base retry delay in seconds
+        max_retry_penalty: float = 15.0,  # Max additional penalty in seconds
+        gradient_sensitivity: float = 2.0,  # How quickly gradient responds (excess_ratio divisor)
+    ):
+        self.window_size = window_size
+        self.p95_baseline = p95_baseline
+        self.min_latency = min_latency
+        self.min_retry_delay = min_retry_delay
+        self.max_retry_penalty = max_retry_penalty
+        self.gradient_sensitivity = gradient_sensitivity
+        
+        # Sliding window for recent latencies
+        self.recent_latencies = deque(maxlen=window_size)
+        
+        # Historical data for slow baseline updates
+        self.historical_latencies = deque(maxlen=5000)
+        
+        # Pre-computed exponential curve for P95 violations
+        self.stress_lookup = self._generate_exponential_curve(window_size)
+    
+    def _generate_exponential_curve(self, size: int) -> list:
+        """Pre-compute exponential (cubic) curve for P95 backpressure"""
+        curve = []
+        for i in range(size + 1):
+            x = i / size
+            # y = x^3: Gentle rise, then steep escalation near saturation
+            y = math.pow(x, 3)
+            curve.append(min(y, 1.0))
+        return curve
+    
+    def _update_baseline(self):
+        """Recalculate baseline P95 infrequently to prevent adaptation during stress"""
+        if len(self.historical_latencies) > 50 and random.random() < 0.1:
+            try:
+                # Update P95 only 10% of the time to keep baseline frozen
+                p95 = statistics.quantiles(self.historical_latencies, n=20)[18]
+                # Only allow baseline to increase slowly, clamped
+                self.p95_baseline = min(p95, self.p95_baseline * 1.05)
+            except (statistics.StatisticsError, IndexError):
+                pass
+    
+    def _calculate_bp_p95(self) -> float:
+        """Component A: Backpressure from P95 Violation"""
+        if not self.recent_latencies:
+            return 0.0
+        
+        # Count requests exceeding the healthy P95 baseline
+        outlier_count = sum(1 for t in self.recent_latencies if t > self.p95_baseline)
+        
+        # Map to exponential curve
+        return self.stress_lookup[outlier_count]
+    
+    def _calculate_bp_gradient(self) -> float:
+        """Component B: Backpressure from Latency Gradient (Queue Congestion)"""
+        if len(self.recent_latencies) < 5:
+            return 0.0
+        
+        # Short-term average latency
+        st_avg = statistics.mean(self.recent_latencies)
+        lt_min = self.min_latency
+        
+        # No queuing if current average <= minimum
+        if st_avg <= lt_min:
+            return 0.0
+        
+        # Calculate excess ratio: how much current avg exceeds bare minimum
+        excess_ratio = (st_avg - lt_min) / lt_min
+        
+        # Map to backpressure (tunable sensitivity)
+        # Default: 200% increase (ratio=2.0) indicates max congestion
+        bp_gradient = min(excess_ratio / self.gradient_sensitivity, 1.0)
+        
+        return bp_gradient
+    
+    def record_latency(self, latency_seconds: float):
+        """
+        Record a request latency for backpressure calculation
+        
+        Call this after each request completes with its duration in seconds.
+        """
+        self.recent_latencies.append(latency_seconds)
+        self.historical_latencies.append(latency_seconds)
+        self._update_baseline()
+    
+    def calculate(
+        self,
+        current_tokens: float,
+        bucket_size: float,
+        token_rate: float,
+        time_until_next: float,
+        rejection_count: int = 0,
+    ) -> float:
+        """
+        Calculate retry-after based on hybrid backpressure
+        
+        Returns: milliseconds to wait
+        """
+        # Calculate both backpressure components
+        bp_p95 = self._calculate_bp_p95()
+        bp_gradient = self._calculate_bp_gradient()
+        
+        # Final backpressure is the maximum (worst case)
+        bp_final = max(bp_p95, bp_gradient)
+        
+        # Calculate retry delay with jitter
+        retry_base = self.min_retry_delay
+        added_penalty = self.max_retry_penalty * bp_final
+        
+        # Add jitter to prevent thundering herd
+        jitter = random.uniform(0.8, 1.2)
+        retry_seconds = (retry_base + added_penalty) * jitter
+        
+        return retry_seconds * 1000  # Convert to milliseconds
+    
+    def get_backpressure_header(self) -> float:
+        """
+        Get current backpressure score for X-Backpressure header
+        
+        Returns: Backpressure score from 0.0 to 1.0
+        """
+        bp_p95 = self._calculate_bp_p95()
+        bp_gradient = self._calculate_bp_gradient()
+        return max(bp_p95, bp_gradient)
 
 
 class FixedCalculator(RetryAfterCalculator):
@@ -290,13 +447,16 @@ def create_calculator(strategy: RetryAfterStrategy, **kwargs) -> RetryAfterCalcu
     
     Example:
         >>> calc = create_calculator(
-        ...     RetryAfterStrategy.UTILIZATION,
-        ...     aggressive_threshold=0.3,
-        ...     warning_threshold=0.6
+        ...     RetryAfterStrategy.BACKPRESSURE,
+        ...     p95_baseline=0.15,
+        ...     min_latency=0.03
         ... )
     """
     
-    if strategy in (RetryAfterStrategy.ADAPTIVE, RetryAfterStrategy.UTILIZATION):
+    if strategy == RetryAfterStrategy.BACKPRESSURE:
+        return BackpressureCalculator(**kwargs)
+    
+    elif strategy in (RetryAfterStrategy.ADAPTIVE, RetryAfterStrategy.UTILIZATION):
         return UtilizationCalculator(**kwargs)
     
     elif strategy == RetryAfterStrategy.FIXED:
@@ -315,5 +475,5 @@ def create_calculator(strategy: RetryAfterStrategy, **kwargs) -> RetryAfterCalcu
         raise ValueError(f"Unknown strategy: {strategy}")
 
 
-# Default recommended strategy
-DEFAULT_CALCULATOR = UtilizationCalculator()
+# Default recommended strategy: Hybrid Backpressure
+DEFAULT_CALCULATOR = BackpressureCalculator()
