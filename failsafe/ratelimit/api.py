@@ -1,11 +1,11 @@
 """
-Enhanced ratelimit API with control plane integration and backpressure
+Enhanced ratelimit API with control plane integration and per-client tracking
 """
 
 import functools
 import time
 from types import TracebackType
-from typing import Any, Optional, Type, cast
+from typing import Any, Optional, Type, cast, Callable
 
 from failsafe.events import get_default_name
 from failsafe.ratelimit.managers import RateLimiter
@@ -24,7 +24,6 @@ try:
 except ImportError:
     CONTROL_PLANE_AVAILABLE = False
     
-    # Fallback stubs
     def register_pattern(*args, **kwargs):
         pass
     
@@ -44,6 +43,7 @@ class ratelimiter:
     * **limiter** - A RateLimiter instance
     * **name** *(optional)* - A component name or ID for control plane
     * **enable_control_plane** *(bool)* - Enable control plane integration (default: True)
+    * **client_id_extractor** *(callable)* - Function to extract client_id from request context
     """
 
     def __init__(
@@ -51,10 +51,12 @@ class ratelimiter:
         limiter: RateLimiter,
         name: Optional[str] = None,
         enable_control_plane: bool = True,
+        client_id_extractor: Optional[Callable] = None,
     ) -> None:
         self._limiter = limiter
         self._name = name or "ratelimiter"
         self._enable_control_plane = enable_control_plane
+        self._client_id_extractor = client_id_extractor
         
         # Register with control plane if available
         if CONTROL_PLANE_AVAILABLE and enable_control_plane:
@@ -72,7 +74,8 @@ class ratelimiter:
         if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
             return self
         
-        await self._limiter.acquire()
+        client_id = self._extract_client_id()
+        await self._limiter.acquire(client_id=client_id)
         return self
 
     async def __aexit__(
@@ -82,11 +85,18 @@ class ratelimiter:
         exc_tb: Optional[TracebackType],
     ) -> Optional[bool]:
         return None
+    
+    def _extract_client_id(self) -> Optional[str]:
+        """Extract client ID from context if extractor is provided"""
+        if self._client_id_extractor:
+            try:
+                return self._client_id_extractor()
+            except:
+                return None
+        return None
 
     def __call__(self, func: FuncT) -> FuncT:
-        """
-        Apply ratelimiter as a decorator
-        """
+        """Apply ratelimiter as a decorator"""
 
         @functools.wraps(func)
         async def _wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -94,7 +104,8 @@ class ratelimiter:
             if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
                 return await func(*args, **kwargs)
             
-            await self._limiter.acquire()
+            client_id = self._extract_client_id()
+            await self._limiter.acquire(client_id=client_id)
             return await func(*args, **kwargs)
 
         _wrapper._original = func  # type: ignore[attr-defined]
@@ -105,43 +116,20 @@ class ratelimiter:
 
 class tokenbucket:
     """
-    Constant Rate Limiting based on the Token Bucket algorithm.
+    Constant Rate Limiting based on the Token Bucket algorithm with per-client tracking support.
 
     **Parameters**
 
     * **max_executions** *(float | None)* - How many executions are permitted? 
-        If None, will use config from failsafe.yaml or default to 100.
     * **per_time_secs** *(float | None)* - Per what time span? (in seconds)
-        If None, will use config from failsafe.yaml or default to 60.
-    * **bucket_size** *(None | float)* - The token bucket size. Defines the max number of executions
-        that are permitted to happen during bursts.
-        The burst is when no executions have happened for a long time, and then you are receiving a
-        bunch of them at the same time. Equal to *max_executions* by default.
-    * **name** *(None | str)* - A component name or ID (will be passed to listeners and metrics)
+    * **bucket_size** *(None | float)* - The token bucket size
+    * **name** *(None | str)* - A component name or ID
     * **retry_after_strategy** *(RetryAfterStrategy | str)* - Strategy for calculating Retry-After
-        Options: 'backpressure', 'fixed', 'utilization', 'adaptive', 'jittered', 'exponential', 'proportional'
-        Default: 'backpressure' (hybrid P95 + latency gradient monitoring)
-    * **retry_after_calculator** *(RetryAfterCalculator | None)* - Custom calculator (advanced)
+    * **retry_after_calculator** *(RetryAfterCalculator | None)* - Custom calculator
     * **enable_control_plane** *(bool)* - Enable control plane integration (default: True)
-    * **track_latency** *(bool)* - Enable automatic latency tracking for backpressure (default: True)
-    
-    **Backpressure Strategy Parameters:**
-    * **window_size** *(int)* - Number of recent requests to track (default: 100)
-    * **p95_baseline** *(float)* - Healthy P95 latency SLO in seconds (default: 0.2)
-    * **min_latency** *(float)* - Minimum processing time in seconds (default: 0.05)
-    * **min_retry_delay** *(float)* - Base retry delay in seconds (default: 1.0)
-    * **max_retry_penalty** *(float)* - Max additional penalty in seconds (default: 15.0)
-    * **gradient_sensitivity** *(float)* - How quickly gradient responds (default: 2.0)
-    
-    **Utilization Strategy Parameters:**
-    * **aggressive_threshold** *(float)* - For utilization strategy: threshold for aggressive backoff (default: 0.2)
-    * **warning_threshold** *(float)* - For utilization strategy: threshold for warning (default: 0.5)
-    * **normal_threshold** *(float)* - For utilization strategy: threshold for normal operation (default: 0.8)
-    
-    **Other Strategy Parameters:**
-    * **jitter_range_ms** *(float)* - For jittered strategy: max jitter in milliseconds (default: 1000)
-    * **backoff_factor** *(float)* - For exponential strategy: backoff multiplier (default: 2.0)
-    * **max_backoff_ms** *(float)* - For exponential strategy: max backoff in milliseconds (default: 60000)
+    * **track_latency** *(bool)* - Enable automatic latency tracking (default: True)
+    * **enable_per_client_tracking** *(bool)* - Enable per-client state tracking (default: False)
+    * **client_id_extractor** *(callable)* - Function to extract client_id from context
     """
 
     def __init__(
@@ -154,27 +142,28 @@ class tokenbucket:
         retry_after_calculator: Optional[RetryAfterCalculator] = None,
         enable_control_plane: bool = True,
         track_latency: bool = True,
-        func: Optional[FuncT] = None,  # For internal use when used as decorator
-        # Backpressure strategy parameters
+        enable_per_client_tracking: bool = False,
+        client_id_extractor: Optional[Callable] = None,
+        func: Optional[FuncT] = None,
+        # Strategy parameters
         window_size: Optional[int] = None,
         p95_baseline: Optional[float] = None,
         min_latency: Optional[float] = None,
         min_retry_delay: Optional[float] = None,
         max_retry_penalty: Optional[float] = None,
         gradient_sensitivity: Optional[float] = None,
-        # Utilization strategy parameters
         aggressive_threshold: Optional[float] = None,
         warning_threshold: Optional[float] = None,
         normal_threshold: Optional[float] = None,
-        # Other strategy parameters
         jitter_range_ms: Optional[float] = None,
         backoff_factor: Optional[float] = None,
         max_backoff_ms: Optional[float] = None,
     ) -> None:
-        # Determine component name
         self._component_name = name or get_default_name(func) if func else "tokenbucket"
         self._enable_control_plane = enable_control_plane
         self._track_latency = track_latency
+        self._enable_per_client_tracking = enable_per_client_tracking
+        self._client_id_extractor = client_id_extractor
         
         # Check for configuration from control plane
         config = {}
@@ -203,6 +192,7 @@ class tokenbucket:
         
         # Build strategy-specific kwargs
         strategy_kwargs = {}
+        strategy_kwargs['enable_per_client_tracking'] = enable_per_client_tracking
         
         # Backpressure parameters
         if window_size is not None:
@@ -241,6 +231,7 @@ class tokenbucket:
             bucket_size=final_bucket_size,
             retry_after_strategy=final_strategy,
             retry_after_calculator=retry_after_calculator,
+            enable_per_client_tracking=enable_per_client_tracking,
             **strategy_kwargs,
         )
 
@@ -257,15 +248,26 @@ class tokenbucket:
                     "bucket_size": final_bucket_size or final_max_executions,
                     "function": func.__qualname__ if func and hasattr(func, '__qualname__') else None,
                     "retry_after_strategy": str(final_strategy),
+                    "per_client_tracking": enable_per_client_tracking,
                 }
             )
+
+    def _extract_client_id(self) -> Optional[str]:
+        """Extract client ID from context if extractor is provided"""
+        if self._client_id_extractor:
+            try:
+                return self._client_id_extractor()
+            except:
+                return None
+        return None
 
     async def __aenter__(self) -> "tokenbucket":
         # Check if disabled via control plane
         if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
             return self
         
-        await self._limiter.acquire()  # Uses lazy bucket property internally
+        client_id = self._extract_client_id()
+        await self._limiter.acquire(client_id=client_id)
         return self
 
     async def __aexit__(
@@ -277,9 +279,7 @@ class tokenbucket:
         return None
 
     def __call__(self, func: FuncT) -> FuncT:
-        """
-        Apply ratelimiter as a decorator with automatic latency tracking
-        """
+        """Apply ratelimiter as a decorator with automatic latency tracking"""
         
         # If name wasn't provided in __init__, use function name
         if self._component_name == "tokenbucket":
@@ -302,8 +302,11 @@ class tokenbucket:
             if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
                 return await func(*args, **kwargs)
             
+            # Extract client ID
+            client_id = self._extract_client_id()
+            
             # Acquire rate limit
-            await self._limiter.acquire()
+            await self._limiter.acquire(client_id=client_id)
             
             # Track latency if enabled and using backpressure calculator
             if self._track_latency:
@@ -314,8 +317,9 @@ class tokenbucket:
                 finally:
                     # Record latency in backpressure calculator
                     latency_seconds = time.perf_counter() - start_time
-                    if isinstance(self._limiter._retry_after_calculator, BackpressureCalculator):
-                        self._limiter._retry_after_calculator.record_latency(latency_seconds)
+                    calc = self._limiter.retry_after_calculator
+                    if isinstance(calc, BackpressureCalculator):
+                        calc.record_latency(latency_seconds, client_id=client_id)
             else:
                 return await func(*args, **kwargs)
 
@@ -324,14 +328,14 @@ class tokenbucket:
 
         return cast(FuncT, _wrapper)
     
-    def get_backpressure(self) -> Optional[float]:
+    def get_backpressure(self, client_id: Optional[str] = None) -> Optional[float]:
         """
         Get current backpressure score (0.0 to 1.0)
         
         Returns None if not using backpressure strategy.
         Use this to populate X-Backpressure header.
         """
-        calc = getattr(self._limiter, '_retry_after_calculator', None)
+        calc = self._limiter.retry_after_calculator
         if isinstance(calc, BackpressureCalculator):
-            return calc.get_backpressure_header()
+            return calc.get_backpressure_header(client_id=client_id)
         return None

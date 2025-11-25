@@ -6,6 +6,7 @@ Provides REST APIs for:
 - Real-time metrics querying
 - Pattern instance discovery and management
 - Health/liveness checks
+- Per-client metrics (when enabled)
 """
 
 import asyncio
@@ -14,7 +15,6 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-from contextlib import asynccontextmanager
 
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -39,40 +39,13 @@ class PatternConfig(BaseModel):
     parameters: Dict[str, Any] = Field(default_factory=dict)
 
 
-class RetryConfig(BaseModel):
-    """Retry pattern configuration"""
-    attempts: Optional[int] = 3
-    backoff: float = 0.5
-    enabled: bool = True
-
-
 class RateLimitConfig(BaseModel):
     """Rate limiter configuration"""
     max_executions: float
     per_time_secs: float
     bucket_size: Optional[float] = None
     enabled: bool = True
-
-
-class TimeoutConfig(BaseModel):
-    """Timeout pattern configuration"""
-    seconds: float
-    enabled: bool = True
-
-
-class CircuitBreakerConfig(BaseModel):
-    """Circuit breaker configuration"""
-    failure_threshold: int = 5
-    success_threshold: int = 2
-    timeout_seconds: float = 60.0
-    enabled: bool = True
-
-
-class BulkheadConfig(BaseModel):
-    """Bulkhead pattern configuration"""
-    max_concurrent: int = 10
-    max_waiting: int = 10
-    enabled: bool = True
+    enable_per_client_tracking: bool = False
 
 
 class MetricsResponse(BaseModel):
@@ -271,7 +244,6 @@ class ConfigManager:
 class ControlPlaneListener:
     """
     Base listener that collects metrics from pattern events.
-    Each pattern type should have a specific implementation.
     """
     
     def __init__(self, pattern_type: str, name: str, collector: MetricsCollector):
@@ -280,28 +252,9 @@ class ControlPlaneListener:
         self.collector = collector
 
 
-class RetryControlPlaneListener(ControlPlaneListener):
-    """Listener for retry pattern metrics"""
-    
-    async def on_retry(self, retry, exception: Exception, counter, backoff: float):
-        await self.collector.increment(self.pattern_type, self.name, "attempts")
-        await self.collector.increment(self.pattern_type, self.name, "retries")
-    
-    async def on_attempts_exceeded(self, retry):
-        await self.collector.increment(self.pattern_type, self.name, "failures")
-        await self.collector.increment(self.pattern_type, self.name, "attempts_exceeded")
-    
-    async def on_success(self, retry, counter):
-        await self.collector.increment(self.pattern_type, self.name, "successes")
-        await self.collector.set_gauge(self.pattern_type, self.name, "last_attempt_count", counter.current_attempt)
-
-
-
-
-
 class TokenBucketControlPlaneListener(ControlPlaneListener):
     pass
-    
+
 
 # ============================================================================
 # FailsafeController - Main Controller Class
@@ -386,6 +339,53 @@ class FailsafeController:
                 "timestamp": datetime.utcnow().isoformat()
             }
         
+        # Per-client metrics (for rate limiters with per-client tracking)
+        @self.app.get(f"{self.prefix}/patterns/ratelimit/{{name}}/clients", tags=["failsafe"])
+        async def list_rate_limit_clients(name: str):
+            """List all active clients for a rate limiter with per-client tracking"""
+            pattern = self.registry.get_pattern("ratelimit", name)
+            if not pattern:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Pattern ratelimit:{name} not found"
+                )
+            
+            # Get client states if per-client tracking is enabled
+            clients = []
+            if hasattr(pattern, "_client_states"):
+                for client_id, state in pattern._client_states.items():
+                    clients.append({
+                        "client_id": client_id,
+                        "rejection_count": state.rejection_count,
+                        "last_rejection": state.last_rejection,
+                        "last_success": state.last_success,
+                    })
+            
+            # Also get backpressure client states if available
+            if hasattr(pattern, "retry_after_calculator"):
+                calc = pattern.retry_after_calculator
+                if hasattr(calc, "_client_states"):
+                    for client_id, bp_state in calc._client_states.items():
+                        # Find or create client info
+                        client_info = next((c for c in clients if c["client_id"] == client_id), None)
+                        if not client_info:
+                            client_info = {"client_id": client_id}
+                            clients.append(client_info)
+                        
+                        client_info["backpressure_latencies"] = len(bp_state.recent_latencies)
+                        client_info["last_latency_update"] = bp_state.last_access
+                        
+                        # Calculate per-client backpressure
+                        if hasattr(calc, "get_backpressure_header"):
+                            client_info["backpressure_score"] = calc.get_backpressure_header(client_id)
+            
+            return {
+                "pattern_name": name,
+                "clients": clients,
+                "total_clients": len(clients),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        
         # Configuration management
         if self.enable_control:
             @self.app.get(f"{self.prefix}/config/{{pattern_type}}/{{name}}", tags=["failsafe"])
@@ -393,7 +393,6 @@ class FailsafeController:
                 """Get configuration for a specific pattern"""
                 config = self.config_manager.get_pattern_config(pattern_type, name)
                 if not config:
-                    # Try to get from runtime config store
                     key = f"{pattern_type}:{name}"
                     config = _CONFIG_STORE.get(key, {})
                 
@@ -407,7 +406,6 @@ class FailsafeController:
             @self.app.put(f"{self.prefix}/config/{{pattern_type}}/{{name}}", tags=["failsafe"])
             async def update_config(pattern_type: str, name: str, config: Dict[str, Any]):
                 """Update configuration for a specific pattern"""
-                # Validate pattern exists
                 pattern = self.registry.get_pattern(pattern_type, name)
                 if not pattern:
                     raise HTTPException(
@@ -415,10 +413,7 @@ class FailsafeController:
                         detail=f"Pattern {pattern_type}:{name} not found"
                     )
                 
-                # Update configuration
                 self.config_manager.update_pattern_config(pattern_type, name, config)
-                
-                # Apply configuration to pattern manager (pattern-specific logic)
                 await self._apply_config_to_pattern(pattern_type, name, pattern, config)
                 
                 return {
@@ -489,7 +484,6 @@ class FailsafeController:
                         detail=f"Pattern {pattern_type}:{name} not found"
                     )
                 
-                # Set enabled flag (pattern-specific logic)
                 if hasattr(pattern, '_enabled'):
                     pattern._enabled = True
                 
@@ -510,7 +504,6 @@ class FailsafeController:
                         detail=f"Pattern {pattern_type}:{name} not found"
                     )
                 
-                # Set enabled flag (pattern-specific logic)
                 if hasattr(pattern, '_enabled'):
                     pattern._enabled = False
                 
@@ -523,16 +516,8 @@ class FailsafeController:
     
     async def _apply_config_to_pattern(self, pattern_type: str, name: str, pattern: Any, config: Dict[str, Any]):
         """Apply configuration changes to a pattern instance"""
-        # Pattern-specific configuration application
         
-        if pattern_type == "retry":
-            if "attempts" in config:
-                pattern._attempts = config["attempts"]
-            if "backoff" in config:
-                from failsafe.retry.backoffs import create_backoff
-                pattern._backoff = create_backoff(config["backoff"])
-        
-        elif pattern_type == "ratelimit":
+        if pattern_type == "ratelimit":
             if hasattr(pattern, '_limiter') and pattern._limiter:
                 bucket = pattern._limiter
                 if "max_executions" in config:
@@ -541,8 +526,8 @@ class FailsafeController:
                     bucket._per_time_secs = config["per_time_secs"]
                 if "bucket_size" in config:
                     bucket._bucket_size = config["bucket_size"]
-        
-        # Add more pattern-specific logic as needed
+                if "enable_per_client_tracking" in config:
+                    bucket._enable_per_client_tracking = config["enable_per_client_tracking"]
 
 
 # ============================================================================
@@ -550,31 +535,21 @@ class FailsafeController:
 # ============================================================================
 
 def register_pattern(pattern_type: str, name: str, manager: Any, metadata: Optional[Dict] = None):
-    """
-    Register a pattern instance with the global registry.
-    Call this from pattern decorators.
-    """
+    """Register a pattern instance with the global registry"""
     _REGISTRY.register(pattern_type, name, manager, metadata)
 
 
 def get_pattern_config(pattern_type: str, name: str) -> Dict[str, Any]:
-    """
-    Get configuration for a pattern from the global config store.
-    Call this from pattern decorators to check for default configs.
-    """
-    # Check if there's a runtime config
+    """Get configuration for a pattern from the global config store"""
     key = f"{pattern_type}:{name}"
     if key in _CONFIG_STORE:
         return _CONFIG_STORE[key]
     
-    # Check default configs loaded from YAML
     pattern_configs = _DEFAULT_CONFIGS.get(pattern_type, {})
     
-    # Try exact match first
     if name in pattern_configs:
         return pattern_configs[name]
     
-    # Try default config
     if "default" in pattern_configs:
         return pattern_configs["default"]
     
@@ -582,16 +557,10 @@ def get_pattern_config(pattern_type: str, name: str) -> Dict[str, Any]:
 
 
 def create_control_plane_listener(pattern_type: str, name: str):
-    """
-    Factory function to create appropriate listener for pattern type.
-    Returns a listener factory that can be used with the event system.
-    """
+    """Factory function to create appropriate listener for pattern type"""
     async def listener_factory(component):
-        if pattern_type == "retry":
-            return RetryControlPlaneListener(pattern_type, name, _METRICS)
         if pattern_type == "tokenbucket":
             return TokenBucketControlPlaneListener(pattern_type, name, _METRICS)
-        # Add more pattern types as needed
         return ControlPlaneListener(pattern_type, name, _METRICS)
     
     return listener_factory

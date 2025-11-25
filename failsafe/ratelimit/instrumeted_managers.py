@@ -29,7 +29,7 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
         per_time_secs: float,
         bucket_size: Optional[float] = None,
         pattern_name: Optional[str] = None,
-        retry_after_strategy: RetryAfterStrategy = RetryAfterStrategy.UTILIZATION,
+        retry_after_strategy: RetryAfterStrategy = RetryAfterStrategy.BACKPRESSURE,
         retry_after_calculator: Optional[RetryAfterCalculator] = None,
         **calculator_kwargs,
     ) -> None:
@@ -60,11 +60,33 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
                     "tokens_available",
                     self.current_tokens
                 )
+                
+                # Track backpressure if available
+                from failsafe.ratelimit.retry_after import BackpressureCalculator
+                if isinstance(self.retry_after_calculator, BackpressureCalculator):
+                    bp_score = self.retry_after_calculator.get_backpressure_header()
+                    await _METRICS.set_gauge(
+                        "ratelimit",
+                        self._pattern_name,
+                        "backpressure",
+                        bp_score
+                    )
         
         except RateLimitExceeded:
             # Track throttling
             if METRICS_AVAILABLE and _METRICS:
                 await _METRICS.increment("ratelimit", self._pattern_name, "throttled")
                 await _METRICS.increment("ratelimit", self._pattern_name, "rejections")
+                
+                # Track backpressure on rejections
+                from failsafe.ratelimit.retry_after import BackpressureCalculator
+                if isinstance(self.retry_after_calculator, BackpressureCalculator):
+                    bp_score = self.retry_after_calculator.get_backpressure_header()
+                    await _METRICS.set_gauge(
+                        "ratelimit",
+                        self._pattern_name,
+                        "backpressure",
+                        bp_score
+                    )
             
             raise
