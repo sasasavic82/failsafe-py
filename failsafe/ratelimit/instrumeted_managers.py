@@ -46,12 +46,15 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
         )
         self._pattern_name = pattern_name or "ratelimit"
     
-    async def acquire(self) -> None:
+    async def acquire(self, client_id: Optional[str] = None) -> None:
         """
         Acquire a token and track metrics
+        
+        Args:
+            client_id: Optional client identifier for per-client tracking
         """
         try:
-            await super().acquire()
+            await super().acquire(client_id=client_id)
             
             # Track successful acquisition
             if METRICS_AVAILABLE and _METRICS:
@@ -66,7 +69,7 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
                 # Track backpressure if available
                 from failsafe.ratelimit.retry_after import BackpressureCalculator
                 if isinstance(self.retry_after_calculator, BackpressureCalculator):
-                    bp_score = self.retry_after_calculator.get_backpressure_header()
+                    bp_score = self.retry_after_calculator.get_backpressure_header(client_id=client_id)
                     await _METRICS.set_gauge(
                         "ratelimit",
                         self._pattern_name,
@@ -83,7 +86,7 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
                 # Track backpressure on rejections
                 from failsafe.ratelimit.retry_after import BackpressureCalculator
                 if isinstance(self.retry_after_calculator, BackpressureCalculator):
-                    bp_score = self.retry_after_calculator.get_backpressure_header()
+                    bp_score = self.retry_after_calculator.get_backpressure_header(client_id=client_id)
                     await _METRICS.set_gauge(
                         "ratelimit",
                         self._pattern_name,
