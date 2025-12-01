@@ -85,11 +85,11 @@ class BackpressureCalculator(RetryAfterCalculator):
     def __init__(
         self,
         window_size: int = 100,
-        p95_baseline: float = 0.2,  # 200ms healthy P95 SLO
+        p95_baseline: float = 1.0,  # 200ms healthy P95 SLO
         min_latency: float = 0.05,  # 50ms minimum processing time
-        min_retry_delay: float = 1.0,  # Base retry delay in seconds
-        max_retry_penalty: float = 15.0,  # Max additional penalty in seconds
-        gradient_sensitivity: float = 2.0,  # How quickly gradient responds (excess_ratio divisor)
+        min_retry_delay: float = 0.001,  # Base retry delay in seconds
+        max_retry_penalty: float = 2.0,  # Max additional penalty in seconds
+        gradient_sensitivity: float = 10.0,  # How quickly gradient responds (excess_ratio divisor)
     ):
         self.window_size = window_size
         self.p95_baseline = p95_baseline
@@ -153,7 +153,8 @@ class BackpressureCalculator(RetryAfterCalculator):
                 # Update P95 only 10% of the time to keep baseline frozen
                 p95 = statistics.quantiles(self.historical_latencies, n=20)[18]
                 # Only allow baseline to increase slowly, clamped
-                self.p95_baseline = min(p95, self.p95_baseline * 1.05)
+                # self.p95_baseline = min(p95, self.p95_baseline * 1.05)
+                self.p95_baseline = self.p95_baseline * 0.95 + p95 * 0.05
             except (statistics.StatisticsError, IndexError):
                 pass
     
@@ -233,8 +234,8 @@ class BackpressureCalculator(RetryAfterCalculator):
         # Final backpressure is the maximum (worst case)
         bp_final = max(bp_p95, bp_gradient)
 
-        if bp_final == 0:
-            return time_until_next * 1000
+        if bp_final < 0.01:  # Essentially zero
+            return max(time_until_next * 1000, 10)  # At least 10ms, or time to next token
         
         # Calculate retry delay with jitter
         retry_base = self.min_retry_delay
