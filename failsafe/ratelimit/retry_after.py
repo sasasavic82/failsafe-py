@@ -232,6 +232,9 @@ class BackpressureCalculator(RetryAfterCalculator):
         
         # Final backpressure is the maximum (worst case)
         bp_final = max(bp_p95, bp_gradient)
+
+        if bp_final == 0:
+            return time_until_next * 1000
         
         # Calculate retry delay with jitter
         retry_base = self.min_retry_delay
