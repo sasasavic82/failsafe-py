@@ -175,7 +175,8 @@ class tokenbucket:
         backoff_factor: Optional[float] = None,
         max_backoff_ms: Optional[float] = None,
     ) -> None:
-        self._component_name = name or get_default_name(func) if func else "tokenbucket"
+        # Store the name - will be finalized in __call__ if not provided
+        self._component_name = name
         self._enable_control_plane = enable_control_plane
         self._track_latency = track_latency
         self._enable_per_client_tracking = enable_per_client_tracking
@@ -183,8 +184,8 @@ class tokenbucket:
         
         # Check for configuration from control plane
         config = {}
-        if CONTROL_PLANE_AVAILABLE and enable_control_plane:
-            config = get_pattern_config("ratelimit", self._component_name)
+        if CONTROL_PLANE_AVAILABLE and enable_control_plane and name:
+            config = get_pattern_config("ratelimit", name)
         
         # Use explicit parameters, fallback to config, then defaults
         final_max_executions = (
@@ -208,9 +209,6 @@ class tokenbucket:
         
         # Build calculator-specific kwargs
         calculator_kwargs = {}
-        
-        # Note: enable_per_client_tracking is passed directly to limiter, 
-        # and limiter will pass it to calculator, so don't duplicate it here
         
         # Backpressure parameters
         if window_size is not None:
@@ -242,11 +240,23 @@ class tokenbucket:
         if max_backoff_ms is not None:
             calculator_kwargs['max_backoff_ms'] = max_backoff_ms
 
-        # Create the limiter with retry-after strategy
+        # Store config for later use when we know the function name
+        self._final_max_executions = final_max_executions
+        self._final_per_time_secs = final_per_time_secs
+        self._final_bucket_size = final_bucket_size
+        self._final_strategy = final_strategy
+        self._retry_after_calculator = retry_after_calculator
+        self._calculator_kwargs = calculator_kwargs
+        
+        # Create limiter - pattern_name will be set properly
+        # Use provided name or a temporary one (will be updated in __call__)
+        pattern_name = name or "tokenbucket"
+        
         self._limiter = InstrumentedTokenBucketLimiter(
             max_executions=final_max_executions,
             per_time_secs=final_per_time_secs,
             bucket_size=final_bucket_size,
+            pattern_name=pattern_name,  # THIS WAS MISSING!
             retry_after_strategy=final_strategy,
             retry_after_calculator=retry_after_calculator,
             enable_per_client_tracking=enable_per_client_tracking,
@@ -254,11 +264,11 @@ class tokenbucket:
         )
 
         # Register with control plane
-        if CONTROL_PLANE_AVAILABLE and enable_control_plane:
-            create_control_plane_listener("tokenbucket", self._component_name)
+        if CONTROL_PLANE_AVAILABLE and enable_control_plane and name:
+            create_control_plane_listener("tokenbucket", name)
             register_pattern(
                 pattern_type="ratelimit",
-                name=self._component_name,
+                name=name,
                 manager=self._limiter,
                 metadata={
                     "max_executions": final_max_executions,
@@ -319,10 +329,22 @@ class tokenbucket:
         """Apply ratelimiter as a decorator with automatic latency tracking"""
         
         # If name wasn't provided in __init__, use function name
-        if self._component_name == "tokenbucket":
+        if self._component_name is None:
             self._component_name = get_default_name(func)
             
-            # Re-register with proper name
+            # Recreate limiter with proper pattern name
+            self._limiter = InstrumentedTokenBucketLimiter(
+                max_executions=self._final_max_executions,
+                per_time_secs=self._final_per_time_secs,
+                bucket_size=self._final_bucket_size,
+                pattern_name=self._component_name,  # Now with correct name!
+                retry_after_strategy=self._final_strategy,
+                retry_after_calculator=self._retry_after_calculator,
+                enable_per_client_tracking=self._enable_per_client_tracking,
+                **self._calculator_kwargs,
+            )
+            
+            # Register with proper name
             if CONTROL_PLANE_AVAILABLE and self._enable_control_plane:
                 register_pattern(
                     pattern_type="ratelimit",
@@ -348,6 +370,7 @@ class tokenbucket:
                 for arg in args:
                     if isinstance(arg, Request):
                         arg.state.endpoint_limiter = self
+                        arg.state.client_id = client_id
                         break
             except ImportError:
                 pass
@@ -355,18 +378,16 @@ class tokenbucket:
             # Acquire rate limit
             await self._limiter.acquire(client_id=client_id)
             
-            # Track latency if enabled and using backpressure calculator
+            # Track latency if enabled
             if self._track_latency:
                 start_time = time.perf_counter()
                 try:
                     result = await func(*args, **kwargs)
                     return result
                 finally:
-                    # Record latency in backpressure calculator
+                    # Record latency in the limiter (which handles backpressure calc)
                     latency_seconds = time.perf_counter() - start_time
-                    calc = self._limiter.retry_after_calculator
-                    if isinstance(calc, BackpressureCalculator):
-                        calc.record_latency(latency_seconds, client_id=client_id)
+                    self._limiter.record_latency(latency_seconds, client_id=client_id)
             else:
                 return await func(*args, **kwargs)
 
