@@ -128,7 +128,7 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
 
             # Prometheus metrics in parallel to controller metrics
             client_label = client_id or (
-                "client" if self.enable_per_client_tracking else "global"
+                "client" if self._enable_per_client_tracking else "global"
             )
             _PR_REQUESTS.labels(self._pattern_name, client_label).inc()
             _PR_TOKENS_AVAILABLE.labels(self._pattern_name).set(
@@ -176,7 +176,7 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
 
             # Prometheus metrics in parallel to controller metrics
             client_label = client_id or (
-                "client" if self.enable_per_client_tracking else "global"
+                "client" if self._enable_per_client_tracking else "global"
             )
             _PR_THROTTLED.labels(self._pattern_name, client_label).inc()
             _PR_REJECTIONS.labels(self._pattern_name, client_label).inc()
