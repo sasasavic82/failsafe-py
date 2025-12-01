@@ -206,39 +206,39 @@ class tokenbucket:
             else config.get("retry_after_strategy", RetryAfterStrategy.BACKPRESSURE)
         )
         
-        # Build strategy-specific kwargs
-        strategy_kwargs = {}
-        strategy_kwargs['enable_per_client_tracking'] = enable_per_client_tracking
+        # Build strategy-specific kwargs (for calculator only)
+        calculator_kwargs = {}
+        calculator_kwargs['enable_per_client_tracking'] = enable_per_client_tracking
         
         # Backpressure parameters
         if window_size is not None:
-            strategy_kwargs['window_size'] = window_size
+            calculator_kwargs['window_size'] = window_size
         if p95_baseline is not None:
-            strategy_kwargs['p95_baseline'] = p95_baseline
+            calculator_kwargs['p95_baseline'] = p95_baseline
         if min_latency is not None:
-            strategy_kwargs['min_latency'] = min_latency
+            calculator_kwargs['min_latency'] = min_latency
         if min_retry_delay is not None:
-            strategy_kwargs['min_retry_delay'] = min_retry_delay
+            calculator_kwargs['min_retry_delay'] = min_retry_delay
         if max_retry_penalty is not None:
-            strategy_kwargs['max_retry_penalty'] = max_retry_penalty
+            calculator_kwargs['max_retry_penalty'] = max_retry_penalty
         if gradient_sensitivity is not None:
-            strategy_kwargs['gradient_sensitivity'] = gradient_sensitivity
+            calculator_kwargs['gradient_sensitivity'] = gradient_sensitivity
         
         # Utilization parameters
         if aggressive_threshold is not None:
-            strategy_kwargs['aggressive_threshold'] = aggressive_threshold
+            calculator_kwargs['aggressive_threshold'] = aggressive_threshold
         if warning_threshold is not None:
-            strategy_kwargs['warning_threshold'] = warning_threshold
+            calculator_kwargs['warning_threshold'] = warning_threshold
         if normal_threshold is not None:
-            strategy_kwargs['normal_threshold'] = normal_threshold
+            calculator_kwargs['normal_threshold'] = normal_threshold
         
         # Other parameters
         if jitter_range_ms is not None:
-            strategy_kwargs['jitter_range_ms'] = jitter_range_ms
+            calculator_kwargs['jitter_range_ms'] = jitter_range_ms
         if backoff_factor is not None:
-            strategy_kwargs['backoff_factor'] = backoff_factor
+            calculator_kwargs['backoff_factor'] = backoff_factor
         if max_backoff_ms is not None:
-            strategy_kwargs['max_backoff_ms'] = max_backoff_ms
+            calculator_kwargs['max_backoff_ms'] = max_backoff_ms
 
         # Create the limiter with retry-after strategy
         self._limiter = InstrumentedTokenBucketLimiter(
@@ -248,7 +248,7 @@ class tokenbucket:
             retry_after_strategy=final_strategy,
             retry_after_calculator=retry_after_calculator,
             enable_per_client_tracking=enable_per_client_tracking,
-            **strategy_kwargs,
+            **calculator_kwargs,
         )
 
         # Register with control plane
