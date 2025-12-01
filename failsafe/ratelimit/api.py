@@ -74,7 +74,15 @@ class ratelimiter:
         if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
             return self
         
-        client_id = self._extract_client_id()
+        # Note: context manager doesn't have access to request args
+        # For FastAPI, use decorator pattern instead
+        client_id = None
+        if self._client_id_extractor:
+            try:
+                client_id = self._client_id_extractor()
+            except:
+                pass
+        
         await self._limiter.acquire(client_id=client_id)
         return self
 
@@ -86,13 +94,21 @@ class ratelimiter:
     ) -> Optional[bool]:
         return None
     
-    def _extract_client_id(self) -> Optional[str]:
+    def _extract_client_id(self, *args, **kwargs) -> Optional[str]:
         """Extract client ID from context if extractor is provided"""
         if self._client_id_extractor:
             try:
                 return self._client_id_extractor()
             except:
-                return None
+                pass
+        
+        # Try to extract from FastAPI Request in args
+        from fastapi import Request
+        for arg in args:
+            if isinstance(arg, Request):
+                from failsafe.integrations.fastapi_helpers import get_client_id_from_request
+                return get_client_id_from_request(arg)
+        
         return None
 
     def __call__(self, func: FuncT) -> FuncT:
@@ -104,7 +120,7 @@ class ratelimiter:
             if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
                 return await func(*args, **kwargs)
             
-            client_id = self._extract_client_id()
+            client_id = self._extract_client_id(*args, **kwargs)
             await self._limiter.acquire(client_id=client_id)
             return await func(*args, **kwargs)
 
@@ -252,13 +268,24 @@ class tokenbucket:
                 }
             )
 
-    def _extract_client_id(self) -> Optional[str]:
+    def _extract_client_id(self, *args, **kwargs) -> Optional[str]:
         """Extract client ID from context if extractor is provided"""
         if self._client_id_extractor:
             try:
                 return self._client_id_extractor()
             except:
-                return None
+                pass
+        
+        # Try to extract from FastAPI Request in args
+        try:
+            from fastapi import Request
+            for arg in args:
+                if isinstance(arg, Request):
+                    from failsafe.integrations.fastapi_helpers import get_client_id_from_request
+                    return get_client_id_from_request(arg)
+        except ImportError:
+            pass
+        
         return None
 
     async def __aenter__(self) -> "tokenbucket":
@@ -266,7 +293,15 @@ class tokenbucket:
         if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
             return self
         
-        client_id = self._extract_client_id()
+        # Note: context manager doesn't have access to request args
+        # For FastAPI with per-client tracking, use decorator pattern instead
+        client_id = None
+        if self._client_id_extractor:
+            try:
+                client_id = self._client_id_extractor()
+            except:
+                pass
+        
         await self._limiter.acquire(client_id=client_id)
         return self
 
@@ -302,8 +337,18 @@ class tokenbucket:
             if hasattr(self._limiter, '_enabled') and not self._limiter._enabled:
                 return await func(*args, **kwargs)
             
-            # Extract client ID
-            client_id = self._extract_client_id()
+            # Extract client ID from request args
+            client_id = self._extract_client_id(*args, **kwargs)
+            
+            # Store limiter in request state for middleware/exception handlers
+            try:
+                from fastapi import Request
+                for arg in args:
+                    if isinstance(arg, Request):
+                        arg.state.endpoint_limiter = self
+                        break
+            except ImportError:
+                pass
             
             # Acquire rate limit
             await self._limiter.acquire(client_id=client_id)

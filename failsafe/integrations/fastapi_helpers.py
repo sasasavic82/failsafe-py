@@ -94,23 +94,23 @@ def add_failsafe_exception_handlers(
         if exc.retry_after_ms is not None:
             headers["X-RateLimit-Retry-After-Ms"] = str(int(exc.retry_after_ms))
         
+        # Extract client ID
+        client_id = extractor(request)
+        headers["X-Client-Id"] = client_id
+        
         # Add backpressure header if enabled
         if include_backpressure:
-            # Try to get backpressure from the limiter that caused the exception
-            # This requires storing a reference in the exception or extracting from request state
-            client_id = extractor(request)
+            # Try to find the limiter from the endpoint
+            backpressure = 1.0  # Default to max on rate limit
             
-            # Check if there's a limiter attached to the request state
-            if hasattr(request.state, "rate_limiter"):
-                limiter = request.state.rate_limiter
+            if hasattr(request.state, "endpoint_limiter"):
+                limiter = request.state.endpoint_limiter
                 if hasattr(limiter, "get_backpressure"):
                     bp_score = limiter.get_backpressure(client_id=client_id)
                     if bp_score is not None:
-                        headers["X-Backpressure"] = f"{bp_score:.3f}"
+                        backpressure = bp_score
             
-            # Fallback: assume high backpressure on rate limit
-            if "X-Backpressure" not in headers:
-                headers["X-Backpressure"] = "1.000"
+            headers["X-Backpressure"] = f"{backpressure:.3f}"
         
         return JSONResponse(
             status_code=429,
@@ -119,7 +119,7 @@ def add_failsafe_exception_handlers(
                 "message": str(exc),
                 "retry_after_seconds": exc.retry_after_seconds,
                 "retry_after_ms": exc.retry_after_ms,
-                "client_id": extractor(request),  # Include for debugging
+                "client_id": client_id,
             },
             headers=headers,
         )
@@ -184,9 +184,10 @@ def rate_limit_middleware(
             # Add client ID header for transparency
             response.headers["X-Client-Id"] = client_id
             
-            # Try to get limiter from request state (set by decorator/context manager)
-            if hasattr(request.state, "rate_limiter"):
-                limiter = request.state.rate_limiter
+            # Check if endpoint has a rate limiter decorator
+            # Look for _manager attribute on the endpoint function
+            if hasattr(request.state, "endpoint_limiter"):
+                limiter = request.state.endpoint_limiter
                 
                 if add_rate_limit_headers:
                     # Add rate limit info

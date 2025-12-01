@@ -92,6 +92,7 @@ class BackpressureCalculator(RetryAfterCalculator):
         self.historical_latencies = deque(maxlen=5000)
         
         # Pre-computed exponential curve for P95 violations
+        
         self.stress_lookup = self._generate_exponential_curve(window_size)
     
     def _generate_exponential_curve(self, size: int) -> list:
