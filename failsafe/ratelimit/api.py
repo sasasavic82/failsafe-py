@@ -206,9 +206,11 @@ class tokenbucket:
             else config.get("retry_after_strategy", RetryAfterStrategy.BACKPRESSURE)
         )
         
-        # Build strategy-specific kwargs (for calculator only)
+        # Build calculator-specific kwargs
         calculator_kwargs = {}
-        calculator_kwargs['enable_per_client_tracking'] = enable_per_client_tracking
+        
+        # Note: enable_per_client_tracking is passed directly to limiter, 
+        # and limiter will pass it to calculator, so don't duplicate it here
         
         # Backpressure parameters
         if window_size is not None:
