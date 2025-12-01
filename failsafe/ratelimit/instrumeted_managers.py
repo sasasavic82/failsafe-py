@@ -21,37 +21,36 @@ except ImportError:
     METRICS_AVAILABLE = False
     _METRICS = None
 
-    # Prometheus metrics (do not replace controller metrics; add alongside)
-    _PR_REQUESTS = Counter(
-        "failsafe_ratelimit_requests_total",
-        "Total successful rate-limited requests",
-        labelnames=["pattern", "client"],
-    )
+# Prometheus metrics (do not replace controller metrics; add alongside)
+_PR_REQUESTS = Counter(
+    "failsafe_ratelimit_requests_total",
+    "Total successful rate-limited requests",
+    labelnames=["pattern", "client"],
+)
 
-    _PR_THROTTLED = Counter(
-        "failsafe_ratelimit_throttled_total",
-        "Total throttled (RateLimitExceeded) events",
-        labelnames=["pattern", "client"],
-    )
+_PR_THROTTLED = Counter(
+    "failsafe_ratelimit_throttled_total",
+    "Total throttled (RateLimitExceeded) events",
+    labelnames=["pattern", "client"],
+)
 
-    _PR_REJECTIONS = Counter(
-        "failsafe_ratelimit_rejections_total",
-        "Total rejections due to rate limiting",
-        labelnames=["pattern", "client"],
-    )
+_PR_REJECTIONS = Counter(
+    "failsafe_ratelimit_rejections_total",
+    "Total rejections due to rate limiting",
+    labelnames=["pattern", "client"],
+)
 
-    _PR_TOKENS_AVAILABLE = Gauge(
-        "failsafe_ratelimit_tokens_available",
-        "Current tokens available in the bucket",
-        labelnames=["pattern"],
-    )
+_PR_TOKENS_AVAILABLE = Gauge(
+    "failsafe_ratelimit_tokens_available",
+    "Current tokens available in the bucket",
+    labelnames=["pattern"],
+)
 
-    _PR_BACKPRESSURE = Gauge(
-        "failsafe_ratelimit_backpressure",
-        "Current backpressure score (if available)",
-        labelnames=["pattern", "client"],
-    )
-
+_PR_BACKPRESSURE = Gauge(
+    "failsafe_ratelimit_backpressure",
+    "Current backpressure score (if available)",
+    labelnames=["pattern", "client"],
+)
 
 class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
     """
