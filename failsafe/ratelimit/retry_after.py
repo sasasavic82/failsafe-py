@@ -8,10 +8,11 @@ before retrying when rate limited.
 import math
 import random
 import statistics
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from enum import Enum
-from typing import Optional
+from typing import Optional, Dict
 
 
 class RetryAfterStrategy(str, Enum):
@@ -36,6 +37,7 @@ class RetryAfterCalculator(ABC):
         token_rate: float,  # tokens per second
         time_until_next: float,  # seconds until next token
         rejection_count: int = 0,  # how many times this client was rejected
+        client_id: Optional[str] = None,  # optional client identifier
     ) -> float:
         """
         Calculate retry-after time
@@ -44,6 +46,25 @@ class RetryAfterCalculator(ABC):
             Milliseconds to wait before retrying
         """
         pass
+
+
+class ClientBackpressureState:
+    """Per-client backpressure tracking state"""
+    
+    def __init__(self, window_size: int = 100):
+        self.recent_latencies = deque(maxlen=window_size)
+        self.historical_latencies = deque(maxlen=5000)
+        self.last_access = time.time()
+    
+    def record_latency(self, latency: float):
+        """Record a latency measurement for this client"""
+        self.recent_latencies.append(latency)
+        self.historical_latencies.append(latency)
+        self.last_access = time.time()
+    
+    def is_stale(self, max_age: float = 3600) -> bool:
+        """Check if this client state is stale (unused for max_age seconds)"""
+        return (time.time() - self.last_access) > max_age
 
 
 class BackpressureCalculator(RetryAfterCalculator):
@@ -58,15 +79,7 @@ class BackpressureCalculator(RetryAfterCalculator):
     
     The backpressure score (0.0 to 1.0) is then used to calculate Retry-After with jitter.
     
-    Pros:
-    - Proactive queue congestion detection (leading indicator)
-    - Maintains SLO compliance (never normalizes degradation)
-    - Self-regulating under load
-    - Prevents thundering herd via jitter
-    
-    Cons:
-    - Requires latency tracking overhead
-    - More complex than simple strategies
+    Supports per-client tracking when client_id is provided.
     """
     
     def __init__(
@@ -85,14 +98,17 @@ class BackpressureCalculator(RetryAfterCalculator):
         self.max_retry_penalty = max_retry_penalty
         self.gradient_sensitivity = gradient_sensitivity
         
-        # Sliding window for recent latencies
+        # Global sliding window for recent latencies (used when no client_id)
         self.recent_latencies = deque(maxlen=window_size)
         
         # Historical data for slow baseline updates
         self.historical_latencies = deque(maxlen=5000)
         
-        # Pre-computed exponential curve for P95 violations
+        # Per-client state tracking (automatically used when client_id is provided)
+        self._client_states: Dict[str, ClientBackpressureState] = {}
+        self._last_cleanup = time.time()
         
+        # Pre-computed exponential curve for P95 violations
         self.stress_lookup = self._generate_exponential_curve(window_size)
     
     def _generate_exponential_curve(self, size: int) -> list:
@@ -105,6 +121,31 @@ class BackpressureCalculator(RetryAfterCalculator):
             curve.append(min(y, 1.0))
         return curve
     
+    def _cleanup_stale_clients(self):
+        """Remove stale client states to prevent memory leaks"""
+        now = time.time()
+        if now - self._last_cleanup < 300:  # Cleanup every 5 minutes
+            return
+        
+        stale_clients = [
+            client_id for client_id, state in self._client_states.items()
+            if state.is_stale()
+        ]
+        for client_id in stale_clients:
+            del self._client_states[client_id]
+        
+        self._last_cleanup = now
+    
+    def _get_client_state(self, client_id: Optional[str]) -> Optional[ClientBackpressureState]:
+        """Get or create client state if client_id is provided"""
+        if client_id is None:
+            return None
+        
+        if client_id not in self._client_states:
+            self._client_states[client_id] = ClientBackpressureState(self.window_size)
+        
+        return self._client_states[client_id]
+    
     def _update_baseline(self):
         """Recalculate baseline P95 infrequently to prevent adaptation during stress"""
         if len(self.historical_latencies) > 50 and random.random() < 0.1:
@@ -116,24 +157,24 @@ class BackpressureCalculator(RetryAfterCalculator):
             except (statistics.StatisticsError, IndexError):
                 pass
     
-    def _calculate_bp_p95(self) -> float:
+    def _calculate_bp_p95(self, latencies: deque) -> float:
         """Component A: Backpressure from P95 Violation"""
-        if not self.recent_latencies:
+        if not latencies:
             return 0.0
         
         # Count requests exceeding the healthy P95 baseline
-        outlier_count = sum(1 for t in self.recent_latencies if t > self.p95_baseline)
+        outlier_count = sum(1 for t in latencies if t > self.p95_baseline)
         
         # Map to exponential curve
-        return self.stress_lookup[outlier_count]
+        return self.stress_lookup[min(outlier_count, len(self.stress_lookup) - 1)]
     
-    def _calculate_bp_gradient(self) -> float:
+    def _calculate_bp_gradient(self, latencies: deque) -> float:
         """Component B: Backpressure from Latency Gradient (Queue Congestion)"""
-        if len(self.recent_latencies) < 5:
+        if len(latencies) < 5:
             return 0.0
         
         # Short-term average latency
-        st_avg = statistics.mean(self.recent_latencies)
+        st_avg = statistics.mean(latencies)
         lt_min = self.min_latency
         
         # No queuing if current average <= minimum
@@ -144,20 +185,28 @@ class BackpressureCalculator(RetryAfterCalculator):
         excess_ratio = (st_avg - lt_min) / lt_min
         
         # Map to backpressure (tunable sensitivity)
-        # Default: 200% increase (ratio=2.0) indicates max congestion
         bp_gradient = min(excess_ratio / self.gradient_sensitivity, 1.0)
         
         return bp_gradient
     
-    def record_latency(self, latency_seconds: float):
+    def record_latency(self, latency_seconds: float, client_id: Optional[str] = None):
         """
         Record a request latency for backpressure calculation
         
         Call this after each request completes with its duration in seconds.
         """
+        # Record in global state
         self.recent_latencies.append(latency_seconds)
         self.historical_latencies.append(latency_seconds)
         self._update_baseline()
+        
+        # Record in per-client state if enabled
+        client_state = self._get_client_state(client_id)
+        if client_state:
+            client_state.record_latency(latency_seconds)
+        
+        # Periodic cleanup
+        self._cleanup_stale_clients()
     
     def calculate(
         self,
@@ -166,15 +215,20 @@ class BackpressureCalculator(RetryAfterCalculator):
         token_rate: float,
         time_until_next: float,
         rejection_count: int = 0,
+        client_id: Optional[str] = None,
     ) -> float:
         """
         Calculate retry-after based on hybrid backpressure
         
         Returns: milliseconds to wait
         """
+        # Get appropriate latency data (per-client or global)
+        client_state = self._get_client_state(client_id)
+        latencies = client_state.recent_latencies if client_state else self.recent_latencies
+        
         # Calculate both backpressure components
-        bp_p95 = self._calculate_bp_p95()
-        bp_gradient = self._calculate_bp_gradient()
+        bp_p95 = self._calculate_bp_p95(latencies)
+        bp_gradient = self._calculate_bp_gradient(latencies)
         
         # Final backpressure is the maximum (worst case)
         bp_final = max(bp_p95, bp_gradient)
@@ -189,30 +243,23 @@ class BackpressureCalculator(RetryAfterCalculator):
         
         return retry_seconds * 1000  # Convert to milliseconds
     
-    def get_backpressure_header(self) -> float:
+    def get_backpressure_header(self, client_id: Optional[str] = None) -> float:
         """
         Get current backpressure score for X-Backpressure header
         
         Returns: Backpressure score from 0.0 to 1.0
         """
-        bp_p95 = self._calculate_bp_p95()
-        bp_gradient = self._calculate_bp_gradient()
+        client_state = self._get_client_state(client_id)
+        latencies = client_state.recent_latencies if client_state else self.recent_latencies
+        
+        bp_p95 = self._calculate_bp_p95(latencies)
+        bp_gradient = self._calculate_bp_gradient(latencies)
         return max(bp_p95, bp_gradient)
 
 
 class FixedCalculator(RetryAfterCalculator):
     """
     Fixed strategy: Wait exactly until next token becomes available
-    
-    Retry-After = time_until_next_token
-    
-    Pros:
-    - Simple and predictable
-    - Efficient (no wasted capacity)
-    
-    Cons:
-    - Can cause thundering herd (all clients retry at same time)
-    - Allows bucket to be completely emptied
     """
     
     def calculate(
@@ -222,39 +269,21 @@ class FixedCalculator(RetryAfterCalculator):
         token_rate: float,
         time_until_next: float,
         rejection_count: int = 0,
+        client_id: Optional[str] = None,
     ) -> float:
-        # Convert to milliseconds
         return time_until_next * 1000
 
 
 class UtilizationCalculator(RetryAfterCalculator):
     """
     Utilization/Adaptive strategy: Adjust wait time based on bucket fill level
-    
-    This prevents the bucket from being depleted by slowing clients down
-    progressively as the bucket empties.
-    
-    Strategy:
-    - 80-100% full: No wait (allow through)
-    - 50-80% full: Normal wait (time until next token)
-    - 20-50% full: 2x wait (slow down traffic)
-    - 0-20% full: 4x wait (aggressive backoff to prevent depletion)
-    
-    Pros:
-    - Prevents bucket depletion
-    - Smooth traffic shaping
-    - Self-regulating under load
-    
-    Cons:
-    - Clients experience slowdown before hard limit
-    - More complex to understand
     """
     
     def __init__(
         self,
-        aggressive_threshold: float = 0.2,  # Below 20% triggers aggressive backoff
-        warning_threshold: float = 0.5,     # Below 50% triggers slow down
-        normal_threshold: float = 0.8,      # Below 80% triggers normal wait
+        aggressive_threshold: float = 0.2,
+        warning_threshold: float = 0.5,
+        normal_threshold: float = 0.8,
         aggressive_multiplier: float = 4.0,
         warning_multiplier: float = 2.0,
     ):
@@ -271,12 +300,8 @@ class UtilizationCalculator(RetryAfterCalculator):
         token_rate: float,
         time_until_next: float,
         rejection_count: int = 0,
+        client_id: Optional[str] = None,
     ) -> float:
-        """
-        Calculate adaptive retry-after based on bucket utilization
-        
-        Returns: milliseconds to wait
-        """
         if bucket_size <= 0:
             return time_until_next * 1000
         
@@ -284,45 +309,24 @@ class UtilizationCalculator(RetryAfterCalculator):
         base_wait_ms = time_until_next * 1000
         
         if utilization >= self.normal_threshold:
-            # 80-100% full: Bucket is healthy, allow through
-            # Return 0 to indicate no throttling needed (yet)
             return 0
-        
         elif utilization >= self.warning_threshold:
-            # 50-80% full: Normal rate limiting
-            # Wait for next token at normal rate
             return base_wait_ms
-        
         elif utilization >= self.aggressive_threshold:
-            # 20-50% full: Bucket is draining, slow down
-            # Double the wait time to reduce pressure
             return base_wait_ms * self.warning_multiplier
-        
         else:
-            # 0-20% full: Critical - bucket nearly empty
-            # Aggressive backoff to prevent complete depletion
             return base_wait_ms * self.aggressive_multiplier
 
 
 class JitteredCalculator(RetryAfterCalculator):
     """
     Jittered strategy: Add random jitter to prevent thundering herd
-    
-    Retry-After = time_until_next_token + random(0, jitter_range)
-    
-    Pros:
-    - Prevents thundering herd (clients retry at different times)
-    - Simple to implement
-    
-    Cons:
-    - Less predictable for clients
-    - May slightly increase average wait time
     """
     
     def __init__(
         self,
-        jitter_range_ms: float = 1000,  # Max jitter in milliseconds
-        jitter_type: str = "full",  # "full" or "equal"
+        jitter_range_ms: float = 1000,
+        jitter_type: str = "full",
     ):
         self.jitter_range_ms = jitter_range_ms
         self.jitter_type = jitter_type
@@ -334,14 +338,13 @@ class JitteredCalculator(RetryAfterCalculator):
         token_rate: float,
         time_until_next: float,
         rejection_count: int = 0,
+        client_id: Optional[str] = None,
     ) -> float:
         base_wait_ms = time_until_next * 1000
         
         if self.jitter_type == "full":
-            # Full jitter: random between 0 and jitter_range
             jitter = random.uniform(0, self.jitter_range_ms)
         else:
-            # Equal jitter: half fixed, half random
             jitter = (self.jitter_range_ms / 2) + random.uniform(0, self.jitter_range_ms / 2)
         
         return base_wait_ms + jitter
@@ -350,27 +353,25 @@ class JitteredCalculator(RetryAfterCalculator):
 class ExponentialCalculator(RetryAfterCalculator):
     """
     Exponential backoff: Increase wait time for repeated violations
-    
-    Retry-After = base_wait * (backoff_factor ^ rejection_count)
-    
-    Useful for penalizing aggressive clients who ignore rate limits.
-    
-    Pros:
-    - Penalizes repeated violations
-    - Helps identify misbehaving clients
-    
-    Cons:
-    - Requires tracking per-client rejection count
-    - Can be punitive for legitimate clients with bursty traffic
     """
     
     def __init__(
         self,
         backoff_factor: float = 2.0,
-        max_backoff_ms: float = 60000,  # Cap at 60 seconds
+        max_backoff_ms: float = 60000,
     ):
         self.backoff_factor = backoff_factor
         self.max_backoff_ms = max_backoff_ms
+        # Per-client rejection tracking
+        self._client_rejections: Dict[str, int] = {}
+        self._last_cleanup = time.time()
+    
+    def _cleanup_stale_clients(self):
+        """Cleanup old client rejection counts"""
+        now = time.time()
+        if now - self._last_cleanup > 300:  # Every 5 minutes
+            self._client_rejections.clear()
+            self._last_cleanup = now
     
     def calculate(
         self,
@@ -379,31 +380,26 @@ class ExponentialCalculator(RetryAfterCalculator):
         token_rate: float,
         time_until_next: float,
         rejection_count: int = 0,
+        client_id: Optional[str] = None,
     ) -> float:
         base_wait_ms = time_until_next * 1000
         
-        # Apply exponential backoff based on rejection count
+        # Use per-client rejection count if available
+        if client_id:
+            self._client_rejections[client_id] = self._client_rejections.get(client_id, 0) + 1
+            rejection_count = self._client_rejections[client_id]
+            self._cleanup_stale_clients()
+        
+        # Apply exponential backoff
         multiplier = self.backoff_factor ** rejection_count
         wait_ms = base_wait_ms * multiplier
         
-        # Cap at maximum
         return min(wait_ms, self.max_backoff_ms)
 
 
 class ProportionalCalculator(RetryAfterCalculator):
     """
     Proportional strategy: Scale wait time based on remaining capacity
-    
-    Retry-After = base_wait * (1 + (1 - utilization))
-    
-    The less capacity available, the longer the wait.
-    
-    Pros:
-    - Smooth scaling with load
-    - Easy to understand
-    
-    Cons:
-    - May not prevent complete depletion under heavy load
     """
     
     def __init__(
@@ -419,6 +415,7 @@ class ProportionalCalculator(RetryAfterCalculator):
         token_rate: float,
         time_until_next: float,
         rejection_count: int = 0,
+        client_id: Optional[str] = None,
     ) -> float:
         base_wait_ms = time_until_next * 1000
         
@@ -426,10 +423,6 @@ class ProportionalCalculator(RetryAfterCalculator):
             return base_wait_ms
         
         utilization = current_tokens / bucket_size
-        
-        # Inverse utilization: as bucket empties, multiplier increases
-        # utilization = 1.0 → multiplier = 1.0 (full bucket)
-        # utilization = 0.0 → multiplier = max_multiplier (empty bucket)
         multiplier = 1.0 + ((1.0 - utilization) * (self.max_multiplier - 1.0))
         
         return base_wait_ms * multiplier
@@ -439,42 +432,34 @@ def create_calculator(strategy: RetryAfterStrategy, **kwargs) -> RetryAfterCalcu
     """
     Factory function to create retry-after calculators
     
-    Args:
-        strategy: The calculation strategy to use
-        **kwargs: Strategy-specific parameters
-    
-    Returns:
-        Configured calculator instance
-    
-    Example:
-        >>> calc = create_calculator(
-        ...     RetryAfterStrategy.BACKPRESSURE,
-        ...     p95_baseline=0.15,
-        ...     min_latency=0.03
-        ... )
+    Note: enable_per_client_tracking is not needed here - calculators automatically
+    use per-client state when client_id is provided to calculate()
     """
     
+    # Remove enable_per_client_tracking if present (it's not used by calculators)
+    kwargs_filtered = {k: v for k, v in kwargs.items() if k != 'enable_per_client_tracking'}
+    
     if strategy == RetryAfterStrategy.BACKPRESSURE:
-        return BackpressureCalculator(**kwargs)
+        return BackpressureCalculator(**kwargs_filtered)
     
     elif strategy in (RetryAfterStrategy.ADAPTIVE, RetryAfterStrategy.UTILIZATION):
-        return UtilizationCalculator(**kwargs)
+        return UtilizationCalculator(**kwargs_filtered)
     
     elif strategy == RetryAfterStrategy.FIXED:
         return FixedCalculator()
     
     elif strategy == RetryAfterStrategy.JITTERED:
-        return JitteredCalculator(**kwargs)
+        return JitteredCalculator(**kwargs_filtered)
     
     elif strategy == RetryAfterStrategy.EXPONENTIAL:
-        return ExponentialCalculator(**kwargs)
+        return ExponentialCalculator(**kwargs_filtered)
     
     elif strategy == RetryAfterStrategy.PROPORTIONAL:
-        return ProportionalCalculator(**kwargs)
+        return ProportionalCalculator(**kwargs_filtered)
     
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
 
-# Default recommended strategy: Hybrid Backpressure
+# Default recommended strategy
 DEFAULT_CALCULATOR = BackpressureCalculator()

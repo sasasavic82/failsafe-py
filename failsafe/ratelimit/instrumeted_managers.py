@@ -31,15 +31,17 @@ class InstrumentedTokenBucketLimiter(TokenBucketLimiter):
         pattern_name: Optional[str] = None,
         retry_after_strategy: RetryAfterStrategy = RetryAfterStrategy.BACKPRESSURE,
         retry_after_calculator: Optional[RetryAfterCalculator] = None,
+        enable_per_client_tracking: bool = False,
         **calculator_kwargs,
     ) -> None:
-        # Pass retry-after parameters to parent
+        # Pass all parameters to parent (which handles calculator_kwargs properly)
         super().__init__(
             max_executions=max_executions,
             per_time_secs=per_time_secs,
             bucket_size=bucket_size,
             retry_after_strategy=retry_after_strategy,
             retry_after_calculator=retry_after_calculator,
+            enable_per_client_tracking=enable_per_client_tracking,
             **calculator_kwargs,
         )
         self._pattern_name = pattern_name or "ratelimit"

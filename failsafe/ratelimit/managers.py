@@ -92,17 +92,15 @@ class TokenBucketLimiter(RateLimiter):
         self._bucket_size = bucket_size if bucket_size else max_executions
         self._enable_per_client_tracking = enable_per_client_tracking
         
-        # Pass per-client tracking flag to calculator
-        if 'enable_per_client_tracking' not in calculator_kwargs:
-            calculator_kwargs['enable_per_client_tracking'] = enable_per_client_tracking
-        
         # Retry-After calculation strategy
+        # Note: calculator_kwargs may contain enable_per_client_tracking, but 
+        # create_calculator will filter it out since calculators don't need it
         self._retry_after_calculator = (
             retry_after_calculator or 
             create_calculator(retry_after_strategy, **calculator_kwargs)
         )
         
-        # Per-client state tracking
+        # Per-client state tracking (for rejection counts)
         self._client_states: Dict[str, ClientRateLimitState] = {}
         self._last_cleanup = time.time()
         
