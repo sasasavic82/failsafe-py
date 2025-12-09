@@ -34,7 +34,21 @@ dependencies = [
     "PyYAML ~=6.0.3",
     "fastapi ~=0.120.2",
     "pydantic ~=2.12.3",
-    "prometheus-client ~=0.23.1"
+    "prometheus-client ~=0.23.1",
+
+    # Gen
+    "typer>=0.12.5",
+    "rich>=13.7.1",
+
+    # OTEL Stack
+    "opentelemetry-api>=1.37.0,<2",
+    "opentelemetry-sdk>=1.37.0,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.37.0,<2",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
+    "opentelemetry-instrumentation-asgi>=0.49b0",
+
+    # Prometheus
+    "prometheus-fastapi-instrumentator ~=7.0.2"
 ]
 
 [dependency-groups]
@@ -105,6 +119,10 @@ target-version = "py314"
 
 [tool.ruff.mccabe]
 max-complexity = 10
+
+
+[project.scripts]
+failsafe = "failsafe.generator.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

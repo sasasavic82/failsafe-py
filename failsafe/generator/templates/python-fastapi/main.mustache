@@ -1,0 +1,49 @@
+# coding: utf-8
+
+{{>partial_header}}
+
+import traceback
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+
+# Failsafe
+from failsafe import FailsafeController{{#otel}}, Telemetry{{/otel}}{{#protection}}, Protection{{/protection}}
+
+{{#apiInfo}}
+{{#apis}}
+from {{apiPackage}}.{{classFilename}} import router as {{classname}}Router
+{{/apis}}
+{{/apiInfo}}
+
+app = FastAPI(
+    title="{{appName}}",
+    description="{{appDescription}}",
+    version="{{appVersion}}",
+)
+
+# Failsafe Resilience Bootstrap
+FailsafeController(app, service_name="{{packageName}}"){{#otel}} \
+    .with_telemetry(
+        Telemetry.OTEL,
+        endpoint="{{otelEndpoint}}{{^otelEndpoint}}http://otel-collector:4318/v1/metrics{{/otelEndpoint}}",
+    ){{/otel}}{{#protection}} \
+    .with_protection(Protection.{{protectionType}}{{^protectionType}}INGRESS{{/protectionType}}){{/protection}}{{#controlplane}} \
+    .with_controlplane(
+        url="{{controlplaneUrl}}{{^controlplaneUrl}}http://failsafe-controlplane:8080{{/controlplaneUrl}}",
+    ){{/controlplane}}
+
+
+@app.middleware("http")
+async def log_exceptions(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        print("EXCEPTION:", repr(e))
+        traceback.print_exc()
+        return PlainTextResponse(str(e), status_code=500)
+
+{{#apiInfo}}
+{{#apis}}
+app.include_router({{classname}}Router)
+{{/apis}}
+{{/apiInfo}}

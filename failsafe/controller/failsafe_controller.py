@@ -1,566 +1,586 @@
 """
-FailsafeController - Control plane for Failsafe resiliency patterns
+Failsafe Controller - One-line resilience bootstrap for FastAPI applications.
 
-Provides REST APIs for:
-- Dynamic configuration updates
-- Real-time metrics querying
-- Pattern instance discovery and management
-- Health/liveness checks
-- Per-client metrics (when enabled)
+Usage:
+    from fastapi import FastAPI
+    from failsafe import FailsafeController, Telemetry, Protection
+
+    app = FastAPI()
+
+    FailsafeController(app) \\
+        .with_telemetry(Telemetry.OTEL) \\
+        .with_protection(Protection.INGRESS) \\
+        .with_controlplane()
 """
 
-import asyncio
-import weakref
-from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from __future__ import annotations
 
-import yaml
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+import os
+from enum import Enum
+from typing import TYPE_CHECKING, Optional, Callable, Any
 
-# Global registry for pattern instances
-_PATTERN_REGISTRY: Dict[str, Dict[str, Any]] = defaultdict(dict)
-_METRICS_STORE: Dict[str, Dict[str, Any]] = defaultdict(lambda: defaultdict(int))
-_CONFIG_STORE: Dict[str, Dict[str, Any]] = {}
-_DEFAULT_CONFIGS: Dict[str, Dict[str, Any]] = {}
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+    from opentelemetry.sdk.metrics import MeterProvider
 
 
-# ============================================================================
-# Pydantic Models for API
-# ============================================================================
-
-class PatternConfig(BaseModel):
-    """Generic pattern configuration"""
-    pattern_type: str
-    name: str
-    enabled: bool = True
-    parameters: Dict[str, Any] = Field(default_factory=dict)
+class Telemetry(str, Enum):
+    """Telemetry backend options."""
+    OTEL = "otel"
+    PROMETHEUS = "prometheus"
+    NONE = "none"
 
 
-class RateLimitConfig(BaseModel):
-    """Rate limiter configuration"""
-    max_executions: float
-    per_time_secs: float
-    bucket_size: Optional[float] = None
-    enabled: bool = True
-    enable_per_client_tracking: bool = False
+class Protection(str, Enum):
+    """Protection type options."""
+    INGRESS = "ingress"      # Rate limiting on incoming requests
+    EGRESS = "egress"        # Resilience on outgoing requests
+    FULL = "full"            # Both ingress and egress
 
-
-class MetricsResponse(BaseModel):
-    """Response model for metrics"""
-    pattern_type: str
-    name: str
-    metrics: Dict[str, Any]
-    timestamp: str
-
-
-class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str
-    timestamp: str
-    patterns_active: int
-    version: str = "1.0.0"
-
-
-# ============================================================================
-# Pattern Registry and Metrics Collection
-# ============================================================================
-
-class PatternRegistry:
-    """
-    Central registry for all pattern instances.
-    Uses weak references to avoid memory leaks.
-    """
-    
-    def __init__(self):
-        self._patterns: Dict[str, weakref.WeakSet] = defaultdict(weakref.WeakSet)
-        self._metadata: Dict[str, Dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-    
-    def register(self, pattern_type: str, name: str, manager: Any, metadata: Optional[Dict] = None):
-        """Register a pattern instance"""
-        key = f"{pattern_type}:{name}"
-        self._patterns[pattern_type].add(manager)
-        self._metadata[key] = {
-            "name": name,
-            "pattern_type": pattern_type,
-            "manager": manager,
-            "registered_at": datetime.utcnow().isoformat(),
-            "metadata": metadata or {}
-        }
-        
-        # Store in global registry for API access
-        _PATTERN_REGISTRY[pattern_type][name] = {
-            "manager": manager,
-            "metadata": metadata or {},
-            "registered_at": datetime.utcnow().isoformat()
-        }
-    
-    def get_pattern(self, pattern_type: str, name: str) -> Optional[Any]:
-        """Get a specific pattern instance"""
-        key = f"{pattern_type}:{name}"
-        meta = self._metadata.get(key)
-        return meta["manager"] if meta else None
-    
-    def list_patterns(self, pattern_type: Optional[str] = None) -> Dict[str, List[str]]:
-        """List all registered patterns"""
-        if pattern_type:
-            return {pattern_type: list(_PATTERN_REGISTRY.get(pattern_type, {}).keys())}
-        
-        return {
-            ptype: list(patterns.keys())
-            for ptype, patterns in _PATTERN_REGISTRY.items()
-        }
-    
-    def get_all_patterns(self) -> List[Dict[str, Any]]:
-        """Get all pattern instances with metadata"""
-        patterns = []
-        for pattern_type, instances in _PATTERN_REGISTRY.items():
-            for name, data in instances.items():
-                patterns.append({
-                    "pattern_type": pattern_type,
-                    "name": name,
-                    "registered_at": data.get("registered_at"),
-                    "metadata": data.get("metadata", {})
-                })
-        return patterns
-
-
-class MetricsCollector:
-    """
-    Lightweight metrics collector for pattern performance.
-    Integrates with existing event system.
-    """
-    
-    def __init__(self):
-        self._metrics: Dict[str, Dict[str, Any]] = defaultdict(lambda: defaultdict(int))
-        self._lock = asyncio.Lock()
-    
-    async def increment(self, pattern_type: str, name: str, metric: str, value: int = 1):
-        """Increment a metric counter"""
-        async with self._lock:
-            key = f"{pattern_type}:{name}"
-            self._metrics[key][metric] += value
-            self._metrics[key]["last_updated"] = datetime.utcnow().isoformat()
-    
-    async def set_gauge(self, pattern_type: str, name: str, metric: str, value: Any):
-        """Set a gauge metric"""
-        async with self._lock:
-            key = f"{pattern_type}:{name}"
-            self._metrics[key][metric] = value
-            self._metrics[key]["last_updated"] = datetime.utcnow().isoformat()
-    
-    def get_metrics(self, pattern_type: str, name: str) -> Dict[str, Any]:
-        """Get metrics for a specific pattern"""
-        key = f"{pattern_type}:{name}"
-        return dict(self._metrics.get(key, {}))
-    
-    def get_all_metrics(self) -> Dict[str, Dict[str, Any]]:
-        """Get all metrics"""
-        return {k: dict(v) for k, v in self._metrics.items()}
-    
-    def reset_metrics(self, pattern_type: str, name: str):
-        """Reset metrics for a pattern"""
-        key = f"{pattern_type}:{name}"
-        if key in self._metrics:
-            self._metrics[key].clear()
-
-
-# Global instances
-_REGISTRY = PatternRegistry()
-_METRICS = MetricsCollector()
-
-
-# ============================================================================
-# Configuration Management
-# ============================================================================
-
-class ConfigManager:
-    """Manages configuration loading and updates"""
-    
-    def __init__(self, config_path: Optional[Path] = None):
-        self.config_path = config_path or Path("failsafe.yaml")
-        self._configs: Dict[str, Dict[str, Any]] = {}
-    
-    def load_config(self) -> Dict[str, Dict[str, Any]]:
-        """Load configuration from YAML file"""
-        if not self.config_path.exists():
-            return {}
-        
-        try:
-            with open(self.config_path, 'r') as f:
-                config = yaml.safe_load(f)
-                self._configs = config or {}
-                
-                # Store in global default configs
-                global _DEFAULT_CONFIGS
-                _DEFAULT_CONFIGS = self._configs.copy()
-                
-                return self._configs
-        except Exception as e:
-            print(f"Warning: Failed to load config from {self.config_path}: {e}")
-            return {}
-    
-    def get_pattern_config(self, pattern_type: str, name: str) -> Dict[str, Any]:
-        """Get configuration for a specific pattern"""
-        pattern_configs = self._configs.get(pattern_type, {})
-        
-        # Try exact match first
-        if name in pattern_configs:
-            return pattern_configs[name]
-        
-        # Try default config
-        if "default" in pattern_configs:
-            return pattern_configs["default"]
-        
-        return {}
-    
-    def update_pattern_config(self, pattern_type: str, name: str, config: Dict[str, Any]):
-        """Update pattern configuration at runtime"""
-        if pattern_type not in self._configs:
-            self._configs[pattern_type] = {}
-        
-        self._configs[pattern_type][name] = config
-        
-        # Store in global config store
-        key = f"{pattern_type}:{name}"
-        _CONFIG_STORE[key] = config
-    
-    def save_config(self):
-        """Save current configuration to file"""
-        try:
-            with open(self.config_path, 'w') as f:
-                yaml.dump(self._configs, f, default_flow_style=False)
-        except Exception as e:
-            print(f"Warning: Failed to save config to {self.config_path}: {e}")
-
-
-# ============================================================================
-# Control Plane Listener (integrates with existing event system)
-# ============================================================================
-
-class ControlPlaneListener:
-    """
-    Base listener that collects metrics from pattern events.
-    """
-    
-    def __init__(self, pattern_type: str, name: str, collector: MetricsCollector):
-        self.pattern_type = pattern_type
-        self.name = name
-        self.collector = collector
-
-
-class TokenBucketControlPlaneListener(ControlPlaneListener):
-    pass
-
-
-# ============================================================================
-# FailsafeController - Main Controller Class
-# ============================================================================
 
 class FailsafeController:
     """
-    Main controller that integrates Failsafe patterns with FastAPI.
+    Fluent API for bootstrapping Failsafe resilience patterns in FastAPI.
     
-    Usage:
+    Example:
         app = FastAPI()
-        controller = FailsafeController(app, config_path="failsafe.yaml")
+        
+        FailsafeController(app) \\
+            .with_telemetry(Telemetry.OTEL) \\
+            .with_protection(Protection.INGRESS) \\
+            .with_controlplane()
+    
+    This single chain:
+        - Registers all exception handlers (429, 503, 504, etc.)
+        - Adds rate limit info middleware
+        - Sets up OpenTelemetry metrics export
+        - Configures control plane integration
     """
     
     def __init__(
         self,
-        app: FastAPI,
-        config_path: Optional[Path] = None,
-        prefix: str = "/failsafe",
-        enable_metrics: bool = True,
-        enable_control: bool = True,
-    ):
+        app: "FastAPI",
+        *,
+        service_name: Optional[str] = None,
+        namespace: str = "failsafe",
+    ) -> None:
+        """
+        Initialize the Failsafe controller.
+        
+        Args:
+            app: FastAPI application instance
+            service_name: Service name for telemetry (defaults to app.title or env var)
+            namespace: Metric namespace prefix (default: "failsafe")
+        """
         self.app = app
-        self.prefix = prefix
-        self.config_manager = ConfigManager(config_path)
-        self.registry = _REGISTRY
-        self.metrics = _METRICS
-        self.enable_metrics = enable_metrics
-        self.enable_control = enable_control
-        
-        # Load configuration at initialization
-        self.config_manager.load_config()
-        
-        # Register API routes
-        self._register_routes()
-        
-        # Add lifecycle hooks
-        self._add_lifecycle_hooks()
+        self.service_name = service_name or self._resolve_service_name()
+        self.namespace = namespace
+        self._meter_provider: Optional["MeterProvider"] = None
+        self._telemetry_type: Telemetry = Telemetry.NONE
+        self._protection_type: Optional[Protection] = None
+        self._controlplane_enabled: bool = False
+        self._controlplane_url: Optional[str] = None
     
-    def _add_lifecycle_hooks(self):
-        """Add startup/shutdown hooks"""
-        
-        @self.app.on_event("startup")
-        async def startup():
-            print(f"FailsafeController initialized with prefix: {self.prefix}")
-            print(f"Loaded configs: {list(_DEFAULT_CONFIGS.keys())}")
-        
-        @self.app.on_event("shutdown")
-        async def shutdown():
-            print("FailsafeController shutting down")
+    def _resolve_service_name(self) -> str:
+        """Resolve service name from app title or environment."""
+        # Try environment variable first
+        if name := os.environ.get("SERVICE_NAME"):
+            return name
+        if name := os.environ.get("OTEL_SERVICE_NAME"):
+            return name
+        # Fall back to FastAPI app title
+        if hasattr(self.app, "title") and self.app.title:
+            return self.app.title.lower().replace(" ", "-")
+        return "failsafe-service"
     
-    def _register_routes(self):
-        """Register all control plane API routes"""
+    def with_telemetry(
+        self,
+        telemetry_type: Telemetry = Telemetry.OTEL,
+        *,
+        endpoint: Optional[str] = None,
+        export_interval_ms: int = 10000,
+        timeout: int = 5,
+    ) -> "FailsafeController":
+        """
+        Configure telemetry and metrics export.
         
-        # Health and liveness endpoints
-        @self.app.get(f"{self.prefix}/health", response_model=HealthResponse, tags=["failsafe"])
-        async def health():
-            """Health check endpoint"""
-            patterns = self.registry.get_all_patterns()
-            return HealthResponse(
-                status="healthy",
-                timestamp=datetime.utcnow().isoformat(),
-                patterns_active=len(patterns)
+        Args:
+            telemetry_type: Backend type (OTEL, PROMETHEUS, NONE)
+            endpoint: Export endpoint (defaults to env var or localhost)
+            export_interval_ms: How often to export metrics (default: 10s)
+            timeout: Export timeout in seconds
+        
+        Returns:
+            Self for method chaining
+        
+        Example:
+            FailsafeController(app).with_telemetry(Telemetry.OTEL)
+            
+            # With custom endpoint
+            FailsafeController(app).with_telemetry(
+                Telemetry.OTEL,
+                endpoint="http://otel-collector:4318/v1/metrics"
+            )
+        """
+        self._telemetry_type = telemetry_type
+        
+        if telemetry_type == Telemetry.OTEL:
+            self._setup_otel(
+                endpoint=endpoint,
+                export_interval_ms=export_interval_ms,
+                timeout=timeout,
+            )
+        elif telemetry_type == Telemetry.PROMETHEUS:
+            self._setup_prometheus()
+        
+        return self
+    
+    def _setup_otel(
+        self,
+        endpoint: Optional[str] = None,
+        export_interval_ms: int = 10000,
+        timeout: int = 5,
+    ) -> None:
+        """Configure OpenTelemetry metrics export."""
+        try:
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+            from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+            from opentelemetry.metrics import set_meter_provider
+            from failsafe.integrations.opentelemetry import FailsafeOtelInstrumentor
+        except ImportError as e:
+            raise ImportError(
+                "OpenTelemetry dependencies not installed. "
+                "Install with: pip install failsafe[otel]"
+            ) from e
+        
+        # Resolve endpoint
+        otel_endpoint = endpoint or os.environ.get(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://localhost:4318/v1/metrics"
+        )
+        
+        # Create resource with service info
+        resource = Resource.create({
+            "service.name": self.service_name,
+            "service.namespace": self.namespace,
+        })
+        
+        # Create exporter and reader
+        exporter = OTLPMetricExporter(
+            endpoint=otel_endpoint,
+            timeout=timeout,
+        )
+        reader = PeriodicExportingMetricReader(
+            exporter,
+            export_interval_millis=export_interval_ms,
+        )
+        
+        # Create and set meter provider
+        self._meter_provider = MeterProvider(
+            resource=resource,
+            metric_readers=[reader],
+        )
+        set_meter_provider(self._meter_provider)
+        
+        # Instrument Failsafe patterns
+        FailsafeOtelInstrumentor().instrument(
+            namespace=f"{self.namespace}.{self.service_name}",
+            meter_provider=self._meter_provider,
+        )
+    
+    def _setup_prometheus(self) -> None:
+        """Configure Prometheus metrics endpoint."""
+        try:
+            from prometheus_fastapi_instrumentator import Instrumentator
+        except ImportError as e:
+            raise ImportError(
+                "Prometheus dependencies not installed. "
+                "Install with: pip install failsafe[prometheus]"
+            ) from e
+        
+        # Add Prometheus metrics endpoint
+        Instrumentator().instrument(
+            self.app,
+            metric_namespace=self.namespace,
+            metric_subsystem=self.service_name.replace("-", "_"),
+        ).expose(self.app)
+    
+    def with_protection(
+        self,
+        protection_type: Protection = Protection.INGRESS,
+        *,
+        add_headers: bool = True,
+        log_rejections: bool = True,
+    ) -> "FailsafeController":
+        """
+        Configure protection handlers and middleware.
+        
+        Args:
+            protection_type: Type of protection (INGRESS, EGRESS, FULL)
+            add_headers: Add RateLimit-* headers to responses
+            log_rejections: Log rate limit rejections
+        
+        Returns:
+            Self for method chaining
+        
+        Protection types:
+            - INGRESS: Rate limiting on incoming requests (exception handlers + middleware)
+            - EGRESS: Resilience on outgoing requests (retry, circuit breaker handlers)
+            - FULL: Both ingress and egress protection
+        
+        Example:
+            FailsafeController(app).with_protection(Protection.INGRESS)
+        """
+        self._protection_type = protection_type
+        
+        if protection_type in (Protection.INGRESS, Protection.FULL):
+            self._setup_ingress_protection(
+                add_headers=add_headers,
+                log_rejections=log_rejections,
             )
         
-        @self.app.get(f"{self.prefix}/liveness", tags=["failsafe"])
-        async def liveness():
-            """Simple liveness check (ping)"""
-            return {"status": "alive", "timestamp": datetime.utcnow().isoformat()}
+        if protection_type in (Protection.EGRESS, Protection.FULL):
+            self._setup_egress_protection()
         
-        # Pattern discovery
-        @self.app.get(f"{self.prefix}/patterns", tags=["failsafe"])
-        async def list_patterns(pattern_type: Optional[str] = None):
-            """List all registered patterns"""
-            if pattern_type:
-                patterns = self.registry.list_patterns(pattern_type)
+        return self
+    
+    def _setup_ingress_protection(
+        self,
+        add_headers: bool = True,
+        log_rejections: bool = True,
+    ) -> None:
+        """Configure ingress protection (rate limiting)."""
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+        from failsafe.ratelimit.exceptions import RateLimitExceeded, EmptyBucket
+        
+        # Register rate limit exception handler
+        @self.app.exception_handler(RateLimitExceeded)
+        async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+            retry_after_secs = exc.retry_after_ms / 1000
+            
+            if log_rejections:
+                client_id = getattr(exc, "client_id", None) or _get_client_id(request)
+                print(f"[RATE_LIMIT] Rejected {request.method} {request.url.path} "
+                      f"client={client_id} retry_after={retry_after_secs:.2f}s")
+            
+            headers = {
+                "Retry-After": str(int(retry_after_secs + 0.5)),
+                "X-RateLimit-Retry-After-Ms": str(int(exc.retry_after_ms)),
+            }
+            
+            # Add backpressure header if available
+            if hasattr(request.state, "endpoint_limiter"):
+                limiter = request.state.endpoint_limiter
+                client_id = getattr(request.state, "client_id", None)
+                bp = limiter.get_backpressure(client_id=client_id)
+                if bp is not None:
+                    headers["X-Backpressure"] = f"{bp:.3f}"
+            
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "rate_limit_exceeded",
+                    "message": f"Rate limit exceeded. Retry after {exc.retry_after_ms}ms",
+                    "retry_after_seconds": retry_after_secs,
+                    "retry_after_ms": exc.retry_after_ms,
+                },
+                headers=headers,
+            )
+        
+        @self.app.exception_handler(EmptyBucket)
+        async def empty_bucket_handler(request: Request, exc: EmptyBucket):
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "rate_limit_exceeded",
+                    "message": "Rate limit exceeded",
+                },
+                headers={"Retry-After": "1"},
+            )
+        
+        # Add rate limit info middleware
+        if add_headers:
+            @self.app.middleware("http")
+            async def rate_limit_info_middleware(request: Request, call_next):
+                response = await call_next(request)
+                
+                # Add rate limit headers if limiter is available
+                if hasattr(request.state, "endpoint_limiter"):
+                    limiter = request.state.endpoint_limiter
+                    if hasattr(limiter, "_limiter"):
+                        bucket = limiter._limiter
+                        response.headers["RateLimit-Limit"] = str(int(bucket.max_executions))
+                        response.headers["RateLimit-Remaining"] = str(int(bucket.current_tokens))
+                    
+                    # Add backpressure header
+                    client_id = getattr(request.state, "client_id", None)
+                    bp = limiter.get_backpressure(client_id=client_id)
+                    if bp is not None:
+                        response.headers["X-Backpressure"] = f"{bp:.3f}"
+                
+                return response
+    
+    def _setup_egress_protection(self) -> None:
+        """Configure egress protection (retry, circuit breaker, etc.)."""
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+        
+        # Import egress-related exceptions
+        try:
+            from failsafe.retry.exceptions import AttemptsExceeded
+            
+            @self.app.exception_handler(AttemptsExceeded)
+            async def retry_exhausted_handler(request: Request, exc: AttemptsExceeded):
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "service_unavailable",
+                        "message": "Service temporarily unavailable - all retry attempts failed",
+                    },
+                    headers={"Retry-After": "60"},
+                )
+        except ImportError:
+            pass
+        
+        try:
+            from failsafe.circuitbreaker import CircuitBreakerOpen
+            
+            @self.app.exception_handler(CircuitBreakerOpen)
+            async def circuit_breaker_handler(request: Request, exc: CircuitBreakerOpen):
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "circuit_breaker_open",
+                        "message": "Service temporarily unavailable - circuit breaker open",
+                    },
+                    headers={"Retry-After": "30"},
+                )
+        except ImportError:
+            pass
+        
+        try:
+            from failsafe.bulkhead import BulkheadFull
+            
+            @self.app.exception_handler(BulkheadFull)
+            async def bulkhead_handler(request: Request, exc: BulkheadFull):
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "bulkhead_full",
+                        "message": "Service temporarily unavailable - concurrency limit reached",
+                    },
+                    headers={"Retry-After": "5"},
+                )
+        except ImportError:
+            pass
+        
+        try:
+            from failsafe.timeout import TimeoutError as FsTimeoutError
+            
+            @self.app.exception_handler(FsTimeoutError)
+            async def timeout_handler(request: Request, exc: FsTimeoutError):
+                return JSONResponse(
+                    status_code=504,
+                    content={
+                        "error": "timeout",
+                        "message": "Operation timed out",
+                    },
+                )
+        except ImportError:
+            pass
+    
+    def with_controlplane(
+        self,
+        *,
+        url: Optional[str] = None,
+        poll_interval_secs: int = 30,
+        enable_dynamic_config: bool = True,
+    ) -> "FailsafeController":
+        """
+        Enable control plane integration for dynamic configuration.
+        
+        Args:
+            url: Control plane URL (defaults to env var or localhost)
+            poll_interval_secs: How often to poll for config changes
+            enable_dynamic_config: Allow runtime config updates
+        
+        Returns:
+            Self for method chaining
+        
+        Features:
+            - Dynamic rate limit adjustment
+            - Feature flag management
+            - Circuit breaker state control
+            - Real-time configuration updates
+        
+        Example:
+            FailsafeController(app).with_controlplane(
+                url="http://failsafe-controlplane:8080"
+            )
+        """
+        self._controlplane_enabled = True
+        self._controlplane_url = url or os.environ.get(
+            "FAILSAFE_CONTROLPLANE_URL",
+            "http://localhost:8080"
+        )
+        
+        self._setup_controlplane(
+            poll_interval_secs=poll_interval_secs,
+            enable_dynamic_config=enable_dynamic_config,
+        )
+        
+        return self
+    
+    def _setup_controlplane(
+        self,
+        poll_interval_secs: int = 30,
+        enable_dynamic_config: bool = True,
+    ) -> None:
+        """Configure control plane integration."""
+        import asyncio
+        from contextlib import asynccontextmanager
+        
+        # Store original lifespan if exists
+        original_lifespan = getattr(self.app, "router", None)
+        original_lifespan = getattr(original_lifespan, "lifespan_context", None)
+        
+        @asynccontextmanager
+        async def lifespan(app):
+            # Start control plane polling task
+            poll_task = None
+            if enable_dynamic_config:
+                poll_task = asyncio.create_task(
+                    self._poll_controlplane(poll_interval_secs)
+                )
+            
+            # Register with control plane
+            await self._register_with_controlplane()
+            
+            # Run original lifespan if exists
+            if original_lifespan:
+                async with original_lifespan(app):
+                    yield
             else:
-                patterns = self.registry.get_all_patterns()
+                yield
             
-            return {
-                "patterns": patterns,
-                "timestamp": datetime.utcnow().isoformat()
-            }
+            # Cleanup
+            if poll_task:
+                poll_task.cancel()
+                try:
+                    await poll_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Deregister from control plane
+            await self._deregister_from_controlplane()
         
-        # Per-client metrics (for rate limiters with per-client tracking)
-        @self.app.get(f"{self.prefix}/patterns/ratelimit/{{name}}/clients", tags=["failsafe"])
-        async def list_rate_limit_clients(name: str):
-            """List all active clients for a rate limiter with per-client tracking"""
-            pattern = self.registry.get_pattern("ratelimit", name)
-            if not pattern:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Pattern ratelimit:{name} not found"
+        # Note: Setting lifespan after app creation requires FastAPI >= 0.93
+        # For older versions, users should pass lifespan to FastAPI constructor
+        self.app.router.lifespan_context = lifespan
+    
+    async def _register_with_controlplane(self) -> None:
+        """Register this service instance with the control plane."""
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{self._controlplane_url}/api/v1/services/register",
+                    json={
+                        "service_name": self.service_name,
+                        "namespace": self.namespace,
+                        "telemetry": self._telemetry_type.value,
+                        "protection": self._protection_type.value if self._protection_type else None,
+                    },
+                    timeout=5.0,
                 )
-            
-            # Get client states if per-client tracking is enabled
-            clients = []
-            if hasattr(pattern, "_client_states"):
-                for client_id, state in pattern._client_states.items():
-                    clients.append({
-                        "client_id": client_id,
-                        "rejection_count": state.rejection_count,
-                        "last_rejection": state.last_rejection,
-                        "last_success": state.last_success,
-                    })
-            
-            # Also get backpressure client states if available
-            if hasattr(pattern, "retry_after_calculator"):
-                calc = pattern.retry_after_calculator
-                if hasattr(calc, "_client_states"):
-                    for client_id, bp_state in calc._client_states.items():
-                        # Find or create client info
-                        client_info = next((c for c in clients if c["client_id"] == client_id), None)
-                        if not client_info:
-                            client_info = {"client_id": client_id}
-                            clients.append(client_info)
-                        
-                        client_info["backpressure_latencies"] = len(bp_state.recent_latencies)
-                        client_info["last_latency_update"] = bp_state.last_access
-                        
-                        # Calculate per-client backpressure
-                        if hasattr(calc, "get_backpressure_header"):
-                            client_info["backpressure_score"] = calc.get_backpressure_header(client_id)
-            
-            return {
-                "pattern_name": name,
-                "clients": clients,
-                "total_clients": len(clients),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        
-        # Configuration management
-        if self.enable_control:
-            @self.app.get(f"{self.prefix}/config/{{pattern_type}}/{{name}}", tags=["failsafe"])
-            async def get_config(pattern_type: str, name: str):
-                """Get configuration for a specific pattern"""
-                config = self.config_manager.get_pattern_config(pattern_type, name)
-                if not config:
-                    key = f"{pattern_type}:{name}"
-                    config = _CONFIG_STORE.get(key, {})
-                
-                return {
-                    "pattern_type": pattern_type,
-                    "name": name,
-                    "config": config,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            
-            @self.app.put(f"{self.prefix}/config/{{pattern_type}}/{{name}}", tags=["failsafe"])
-            async def update_config(pattern_type: str, name: str, config: Dict[str, Any]):
-                """Update configuration for a specific pattern"""
-                pattern = self.registry.get_pattern(pattern_type, name)
-                if not pattern:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Pattern {pattern_type}:{name} not found"
-                    )
-                
-                self.config_manager.update_pattern_config(pattern_type, name, config)
-                await self._apply_config_to_pattern(pattern_type, name, pattern, config)
-                
-                return {
-                    "pattern_type": pattern_type,
-                    "name": name,
-                    "config": config,
-                    "status": "updated",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            
-            @self.app.get(f"{self.prefix}/config", tags=["failsafe"])
-            async def get_all_configs():
-                """Get all configurations"""
-                return {
-                    "configs": self.config_manager._configs,
-                    "defaults": _DEFAULT_CONFIGS,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-        
-        # Metrics endpoints
-        if self.enable_metrics:
-            @self.app.get(f"{self.prefix}/metrics/{{pattern_type}}/{{name}}", response_model=MetricsResponse, tags=["failsafe"])
-            async def get_metrics(pattern_type: str, name: str):
-                """Get metrics for a specific pattern"""
-                metrics = self.metrics.get_metrics(pattern_type, name)
-                if not metrics:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"No metrics found for {pattern_type}:{name}"
-                    )
-                
-                return MetricsResponse(
-                    pattern_type=pattern_type,
-                    name=name,
-                    metrics=metrics,
-                    timestamp=datetime.utcnow().isoformat()
+        except Exception as e:
+            # Log but don't fail startup
+            print(f"[FAILSAFE] Warning: Could not register with control plane: {e}")
+    
+    async def _deregister_from_controlplane(self) -> None:
+        """Deregister this service instance from the control plane."""
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{self._controlplane_url}/api/v1/services/deregister",
+                    json={"service_name": self.service_name},
+                    timeout=5.0,
                 )
-            
-            @self.app.get(f"{self.prefix}/metrics", tags=["failsafe"])
-            async def get_all_metrics():
-                """Get all metrics"""
-                all_metrics = self.metrics.get_all_metrics()
-                return {
-                    "metrics": all_metrics,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            
-            @self.app.delete(f"{self.prefix}/metrics/{{pattern_type}}/{{name}}", tags=["failsafe"])
-            async def reset_metrics(pattern_type: str, name: str):
-                """Reset metrics for a specific pattern"""
-                self.metrics.reset_metrics(pattern_type, name)
-                return {
-                    "pattern_type": pattern_type,
-                    "name": name,
-                    "status": "reset",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
+        except Exception:
+            pass  # Best effort
+    
+    async def _poll_controlplane(self, interval_secs: int) -> None:
+        """Poll control plane for configuration updates."""
+        import asyncio
         
-        # Pattern control endpoints
-        if self.enable_control:
-            @self.app.post(f"{self.prefix}/control/{{pattern_type}}/{{name}}/enable", tags=["failsafe"])
-            async def enable_pattern(pattern_type: str, name: str):
-                """Enable a specific pattern"""
-                pattern = self.registry.get_pattern(pattern_type, name)
-                if not pattern:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Pattern {pattern_type}:{name} not found"
-                    )
-                
-                if hasattr(pattern, '_enabled'):
-                    pattern._enabled = True
-                
-                return {
-                    "pattern_type": pattern_type,
-                    "name": name,
-                    "status": "enabled",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            
-            @self.app.post(f"{self.prefix}/control/{{pattern_type}}/{{name}}/disable", tags=["failsafe"])
-            async def disable_pattern(pattern_type: str, name: str):
-                """Disable a specific pattern"""
-                pattern = self.registry.get_pattern(pattern_type, name)
-                if not pattern:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Pattern {pattern_type}:{name} not found"
-                    )
-                
-                if hasattr(pattern, '_enabled'):
-                    pattern._enabled = False
-                
-                return {
-                    "pattern_type": pattern_type,
-                    "name": name,
-                    "status": "disabled",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
+        while True:
+            try:
+                await asyncio.sleep(interval_secs)
+                await self._fetch_and_apply_config()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[FAILSAFE] Warning: Control plane poll failed: {e}")
     
-    async def _apply_config_to_pattern(self, pattern_type: str, name: str, pattern: Any, config: Dict[str, Any]):
-        """Apply configuration changes to a pattern instance"""
+    async def _fetch_and_apply_config(self) -> None:
+        """Fetch and apply configuration from control plane."""
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self._controlplane_url}/api/v1/services/{self.service_name}/config",
+                    timeout=5.0,
+                )
+                if response.status_code == 200:
+                    config = response.json()
+                    self._apply_config(config)
+        except Exception:
+            pass  # Continue with current config
+    
+    def _apply_config(self, config: dict) -> None:
+        """Apply configuration updates from control plane."""
+        # Update rate limit configs
+        if "rate_limits" in config:
+            from failsafe.controller import update_rate_limit_config
+            for name, settings in config["rate_limits"].items():
+                update_rate_limit_config(name, settings)
         
-        if pattern_type == "ratelimit":
-            if hasattr(pattern, '_limiter') and pattern._limiter:
-                bucket = pattern._limiter
-                if "max_executions" in config:
-                    bucket._max_executions = config["max_executions"]
-                if "per_time_secs" in config:
-                    bucket._per_time_secs = config["per_time_secs"]
-                if "bucket_size" in config:
-                    bucket._bucket_size = config["bucket_size"]
-                if "enable_per_client_tracking" in config:
-                    bucket._enable_per_client_tracking = config["enable_per_client_tracking"]
+        # Update feature flags
+        if "feature_flags" in config:
+            from failsafe.controller import update_feature_flags
+            update_feature_flags(config["feature_flags"])
+        
+        # Update circuit breaker states
+        if "circuit_breakers" in config:
+            from failsafe.controller import update_circuit_breaker_config
+            for name, settings in config["circuit_breakers"].items():
+                update_circuit_breaker_config(name, settings)
 
 
-# ============================================================================
-# Helper Functions for Pattern Registration
-# ============================================================================
-
-def register_pattern(pattern_type: str, name: str, manager: Any, metadata: Optional[Dict] = None):
-    """Register a pattern instance with the global registry"""
-    _REGISTRY.register(pattern_type, name, manager, metadata)
-
-
-def get_pattern_config(pattern_type: str, name: str) -> Dict[str, Any]:
-    """Get configuration for a pattern from the global config store"""
-    key = f"{pattern_type}:{name}"
-    if key in _CONFIG_STORE:
-        return _CONFIG_STORE[key]
+def _get_client_id(request: "Request") -> str:
+    """Extract client ID from request."""
+    # Try X-Client-Id header first
+    if client_id := request.headers.get("X-Client-Id"):
+        return client_id
     
-    pattern_configs = _DEFAULT_CONFIGS.get(pattern_type, {})
+    # Try X-Forwarded-For
+    if forwarded := request.headers.get("X-Forwarded-For"):
+        return forwarded.split(",")[0].strip()
     
-    if name in pattern_configs:
-        return pattern_configs[name]
+    # Fall back to client host
+    if request.client:
+        return request.client.host
     
-    if "default" in pattern_configs:
-        return pattern_configs["default"]
-    
-    return {}
+    return "unknown"
 
 
-def create_control_plane_listener(pattern_type: str, name: str):
-    """Factory function to create appropriate listener for pattern type"""
-    async def listener_factory(component):
-        if pattern_type == "tokenbucket":
-            return TokenBucketControlPlaneListener(pattern_type, name, _METRICS)
-        return ControlPlaneListener(pattern_type, name, _METRICS)
-    
-    return listener_factory
+# Convenience exports
+__all__ = [
+    "FailsafeController",
+    "Telemetry",
+    "Protection",
+]

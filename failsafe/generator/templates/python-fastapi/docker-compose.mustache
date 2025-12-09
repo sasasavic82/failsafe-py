@@ -1,0 +1,58 @@
+version: '3.6'
+services:
+  # Prometheus
+  {{packageName}}-prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - {{packageName}}_prometheus_data:/prometheus
+      - ./.config/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - {{packageName}}_network
+
+  # Grafana
+  {{packageName}}-grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - {{packageName}}_grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    networks:
+      - {{packageName}}_network
+
+  {{packageName}}-otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-config.yaml"]
+    volumes:
+      - ./.config/otel-config.yaml:/etc/otel-config.yaml
+    ports:
+      - "4318:4318"  # OTLP HTTP receiver
+      - "8889:8889"  # Prometheus exporter
+    networks:
+      - {{packageName}}_network
+
+  {{packageName}}-service:
+    container_name: {{packageName}}-service
+    image: telstra/{{packageName}}-service
+    command: uvicorn {{packageName}}.main:app --host 0.0.0.0 --port {{serverPort}}
+    build:
+      context: .
+      args:
+        GIT_CRED_FILE: .git-credentials
+    ports:
+      - "{{serverPort}}:{{serverPort}}"
+    networks:
+      - {{packageName}}_network
+
+
+volumes:
+  {{packageName}}_grafana_data:
+  {{packageName}}_prometheus_data:
+
+networks:
+  {{packageName}}_network:
+    name: {{packageName}}_network
+    driver: bridge

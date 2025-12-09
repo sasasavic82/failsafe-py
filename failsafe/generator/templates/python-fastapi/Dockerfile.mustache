@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1.7
+
+######################################################################
+# Stage 1: Builder
+######################################################################
+FROM python:3.14-slim AS builder
+
+ARG GIT_CRED_FILE
+ENV GIT_CRED_FILE=${GIT_CRED_FILE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl build-essential git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /usr/src/app
+
+# Copy credentials from context
+
+# {{#gitCreds}}
+# COPY ${GIT_CRED_FILE:-.git-credentials} /root/.git-credentials
+# ENV GIT_ASKPASS=echo
+# RUN if [ -s /root/.git-credentials ]; then \
+#       git config --global credential.helper store && \
+#       git config --global user.name "docker" && \
+#       git config --global user.email "docker@local" && \
+#       sed -n 's#https://\([^:]*\):\([^@]*\)@\([^/]*\).*#machine \3 login \1 password \2#p' /root/.git-credentials > /root/.netrc && \
+#       chmod 600 /root/.netrc ; \
+#     fi
+# {{/gitCreds}}
+
+
+# Copy manifests
+COPY pyproject.toml README.md ./
+RUN test -f uv.lock && cp uv.lock . || true
+
+# Build venv & install all deps (direct from pyproject.toml)
+RUN uv venv && \
+    if [ -f uv.lock ]; then \
+        uv sync --frozen --no-dev; \
+    else \
+        uv sync --no-dev; \
+    fi && \
+    # explicitly install the current project to ensure console_scripts and entrypoints are active
+    uv pip install .
+
+COPY . .
+
+######################################################################
+# Stage 2: Runtime
+######################################################################
+FROM python:3.14-slim AS service
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/app
+COPY --from=builder /usr/src/app /usr/src/app
+
+ENV VIRTUAL_ENV=/usr/src/app/.venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV PYTHONPATH=/usr/src/app/src
+
+EXPOSE {{serverPort}}
+
+CMD ["uvicorn", "{{packageName}}.main:app", "--host", "0.0.0.0", "--port", "{{serverPort}}", "--reload", "--log-level", "debug"]
+

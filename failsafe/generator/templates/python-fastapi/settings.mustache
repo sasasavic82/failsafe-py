@@ -1,0 +1,34 @@
+from typing import Annotated, Literal
+from pydantic import BeforeValidator, HttpUrl, SecretStr, TypeAdapter, computed_field
+from pydantic_settings import BaseSettings
+
+
+def check_str_is_http(x: str) -> str:
+    http_url_adapter = TypeAdapter(HttpUrl)
+    return str(http_url_adapter.validate_python(x))
+
+
+class ServiceSettings(BaseSettings):
+    ENV: str = "dev"
+    
+    OTEL_EXPORTER_OTLP_ENDPOINT: Annotated[str, BeforeValidator(check_str_is_http)] = (
+        "http://{{packageName}}-otel-collector:4318/v1/metrics"
+    )
+
+    HOST: str = "0.0.0.0"
+    PORT: int = {{serverPort}}
+
+    AUTH_SECRET: SecretStr | None = None
+
+    ADAPTIVE_CLIENT: bool = False
+
+    @computed_field
+    @property
+    def BASE_URL(self) -> str:
+        return f"http://{self.HOST}:{self.PORT}"
+
+    def is_dev(self) -> bool:
+        return self.ENV == "dev"
+
+
+settings = ServiceSettings()
