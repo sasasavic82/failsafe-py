@@ -93,7 +93,7 @@ def generate(
     grid.add_row("Output Dir:", str(out_dir))
     grid.add_row("Telemetry:", f"{telemetry.value} ({otel_endpoint if telemetry == TelemetryType.OTEL else 'N/A'})")
     grid.add_row("Protection:", f"{protection_type.value if protection else 'Disabled'}")
-    grid.add_row("Control Plane:", f"{controlplane_url if controlplane else 'Disabled'}")
+    grid.add_row("Control Plane Prefix:", f"{controlplane_prefix if controlplane else 'Disabled'}")
 
     console.print(Panel(
         grid, 
