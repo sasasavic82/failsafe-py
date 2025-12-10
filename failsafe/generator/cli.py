@@ -70,7 +70,7 @@ def generate(
     
     # Control plane options
     controlplane: bool = typer.Option(True, "--controlplane/--no-controlplane"),
-    controlplane_url: str = typer.Option("http://failsafe-controlplane:8080", "--controlplane-url"),
+    controlplane_prefix: str = typer.Option("/failsafe", "--controlplane-prefix"),
     
     extra_props: Optional[str] = typer.Option(None, "--extra-props"),
 ):
@@ -115,7 +115,7 @@ def generate(
         f"protection={'true' if protection else 'false'}",
         f"protectionType={protection_type.value}",
         f"controlplane={'true' if controlplane else 'false'}",
-        f"controlplaneUrl={controlplane_url}",
+        f"controlplanePrefix={controlplane_prefix}",
     ]
     
     if dockerfile:

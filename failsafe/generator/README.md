@@ -1,24 +1,25 @@
 <p align="center">
-  <img src="../../docs/logo.png" alt="Failsafe Generator" style="max-width:350px;width:100%;height:auto;">
+  <img src="../../docs//logo.png" alt="Failsafe" style="max-width:350px;width:100%;height:auto;">
 </p>
 
 <p align="center">
-    <em>From OpenAPI spec to production-ready resilient FastAPI service — in one command</em>
+    <em>Fault tolerance and resiliency patterns for modern Python microservices</em>
 </p>
 
 <p align="center">
     <a href="#installation">Installation</a> •
     <a href="#quick-start">Quick Start</a> •
-    <a href="#cli-reference">CLI Reference</a> •
+    <a href="#code-generation">Code Generation</a> •
     <a href="#openapi-vendor-extensions">Vendor Extensions</a> •
-    <a href="#generated-output">Generated Output</a>
+    <a href="#resiliency-patterns">Patterns</a> •
+    <a href="#observability">Observability</a>
 </p>
 
 ---
 
-**failsafe-generator** is a custom OpenAPI code generator that extends [`openapi-generator`](https://github.com/OpenAPITools/openapi-generator) to produce production-ready, resilient FastAPI microservices.
+**Failsafe** is a collection of production-ready resiliency patterns for microservice-based systems, implemented in idiomatic, async-only Python. It provides self-protecting services and self-regulating clients — resilience through cooperation.
 
-Define your resilience patterns directly in your OpenAPI specification — rate limits, retries, circuit breakers — and generate fully working, protected services automatically.
+Includes a code generator that transforms OpenAPI specifications into fully working, protected FastAPI services — define your resilience patterns in your spec, generate production-ready code automatically.
 
 ---
 
@@ -28,40 +29,55 @@ Define your resilience patterns directly in your OpenAPI specification — rate 
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-- [CLI Reference](#cli-reference)
+- [Code Generation](#code-generation)
+  - [CLI Reference](#cli-reference)
+  - [Generated Output](#generated-output)
 - [OpenAPI Vendor Extensions](#openapi-vendor-extensions)
   - [Global Configuration](#global-configuration)
   - [Rate Limiting](#rate-limiting)
   - [Retry](#retry)
   - [Circuit Breaker](#circuit-breaker)
   - [Timeout](#timeout)
+  - [Combining Patterns](#combining-multiple-patterns)
   - [Complete Example](#complete-openapi-example)
-- [Generated Output](#generated-output)
-  - [Project Structure](#project-structure)
-  - [Generated Code Examples](#generated-code-examples)
-- [Configuration Files](#configuration-files)
-- [Environment Variables](#environment-variables)
-- [Docker Support](#docker-support)
+- [Resiliency Patterns](#resiliency-patterns)
+  - [Rate Limiting](#rate-limiting-decorator)
+  - [Retry](#retry-1)
+  - [Circuit Breaker](#circuit-breaker-1)
+  - [Timeout](#timeout-1)
+  - [Bulkhead](#bulkhead)
+  - [Fallback](#fallback)
+  - [Hedge](#hedge)
+  - [Fail Fast](#fail-fast)
+  - [Feature Toggle](#feature-toggle)
+  - [Cache](#cache)
+- [FastAPI Integration](#fastapi-integration)
+- [Adaptive Clients](#adaptive-clients)
+- [Observability](#observability)
+  - [OpenTelemetry](#opentelemetry-integration)
+  - [Prometheus Metrics](#prometheus-metrics)
+- [How It Works](#how-it-works)
+- [Acknowledgements](#acknowledgements)
 
 ---
 
 ## Key Features
 
 - **Spec-Driven Resilience** — Define rate limits, retries, and circuit breakers in your OpenAPI spec
-- **One-Line Bootstrap** — Generated services use `FailsafeController` for clean setup
+- **Code Generation** — Generate production-ready FastAPI services from OpenAPI specs
+- **One-Line Bootstrap** — `FailsafeController` for clean service setup
+- **AsyncIO-Native** — All patterns designed for modern async Python
+- **Self-Regulating Systems** — Services and clients cooperate via backpressure signals
+- **Adaptive Rate Limiting** — Dynamic `Retry-After` based on real-time system health
 - **Telemetry Built-In** — OpenTelemetry and Prometheus integration out of the box
 - **Control Plane Ready** — Dynamic configuration updates without redeployment
-- **Container Ready** — Generates `Dockerfile`, `.env`, and config files
-- **Drop-In Replacement** — Uses standard `openapi-generator` under the hood
 
 ---
 
 ## Requirements
 
 - Python 3.12+
-- One of:
-  - `openapi-generator-cli` installed locally
-  - Docker (falls back automatically)
+- For code generation: `openapi-generator-cli` or Docker
 
 ---
 
@@ -69,12 +85,12 @@ Define your resilience patterns directly in your OpenAPI specification — rate 
 
 ```bash
 # Install via uv (recommended)
-uv add failsafe-generator
+uv add failsafe
 
 # Or via pip
-pip install failsafe-generator
+pip install failsafe
 
-# Verify installation
+# Verify CLI
 failsafe --help
 ```
 
@@ -82,67 +98,60 @@ failsafe --help
 
 ## Quick Start
 
-### 1. Create your OpenAPI spec with resilience extensions
-
-```yaml
-# product-api.yaml
-openapi: 3.1.0
-info:
-  title: Product Service
-  version: 1.0.0
-
-paths:
-  /products/{product_id}:
-    get:
-      operationId: get_product
-      x-ratelimit:
-        name: get_product
-        max_executions: 5000
-        per_time_secs: 60
-        retry_after_strategy: backpressure
-      responses:
-        '200':
-          description: OK
-```
-
-### 2. Generate your service
+### Option 1: Generate from OpenAPI Spec
 
 ```bash
-failsafe generate product-api.yaml \
-  -o ./product-service \
-  --package-name product_service \
-  --app-name "Product Service"
+# Generate a resilient service from your spec
+failsafe generate api.yaml -o ./my-service --package-name my_service
+
+# Run it
+cd my-service && uvicorn main:app --reload
 ```
 
-### 3. Run the generated service
+### Option 2: Add to Existing FastAPI App
 
-```bash
-cd product-service
-uv sync
-uvicorn main:app --reload --port 8000
+```python
+from fastapi import FastAPI, Request
+from failsafe import FailsafeController, Telemetry, Protection
+from failsafe.ratelimit import tokenbucket, Strategy
+
+app = FastAPI()
+
+# One-line resilience bootstrap
+FailsafeController(app) \
+    .with_telemetry(Telemetry.OTEL) \
+    .with_protection(Protection.INGRESS) \
+    .with_controlplane()
+
+
+@app.get("/products/{product_id}")
+@tokenbucket(
+    name="get_product",
+    max_executions=5000,
+    per_time_secs=60,
+    retry_after_strategy=Strategy.BACKPRESSURE,
+)
+async def get_product(request: Request, product_id: str):
+    return {"id": product_id, "name": "Widget"}
 ```
-
-Your service is now running with:
-- ✅ Rate limiting on `/products/{product_id}`
-- ✅ OpenTelemetry metrics export
-- ✅ Control plane integration
-- ✅ Exception handlers for 429/503/504
 
 ---
 
-## CLI Reference
+## Code Generation
+
+Generate production-ready FastAPI services from OpenAPI specifications with resilience patterns baked in.
+
+### CLI Reference
 
 ```bash
 failsafe generate <spec> [OPTIONS]
 ```
 
-### Arguments
+#### Arguments
 
 | Argument | Description |
 |----------|-------------|
 | `spec` | Path to OpenAPI spec file (YAML or JSON) |
-
-### Options
 
 #### Basic Options
 
@@ -176,7 +185,7 @@ failsafe generate <spec> [OPTIONS]
 | `--controlplane/--no-controlplane` | `true` | Enable control plane |
 | `--controlplane-url` | `http://failsafe-controlplane:8080` | Control plane URL |
 
-### Examples
+#### Examples
 
 ```bash
 # Full setup with all defaults
@@ -195,32 +204,36 @@ failsafe generate openapi.yaml \
   --otel-endpoint http://localhost:4318/v1/metrics \
   --controlplane-url http://localhost:8080
 
-# Egress protection only (for gateway services)
-failsafe generate openapi.yaml --protection-type EGRESS
-
 # Full protection (both ingress and egress)
 failsafe generate openapi.yaml --protection-type FULL
+```
 
-# Use Prometheus instead of OTEL
-failsafe generate openapi.yaml --telemetry PROMETHEUS
+### Generated Output
+
+```
+generated-service/
+├── main.py                    # FastAPI app with FailsafeController
+├── requirements.txt
+├── pyproject.toml
+├── Dockerfile
+├── .env
+├── .config/
+│   ├── otel-config.yaml       # OTEL Collector configuration
+│   └── prometheus.yml         # Prometheus scrape configuration
+└── my_service/
+    ├── __init__.py
+    ├── settings.py
+    ├── apis/
+    │   └── products_api.py    # Routes with resilience decorators
+    └── models/
+        └── product.py
 ```
 
 ---
 
 ## OpenAPI Vendor Extensions
 
-Define resilience patterns directly in your OpenAPI specification using vendor extensions.
-
-### Supported Extension Formats
-
-The generator supports two extension formats:
-
-| Format | Example | Use Case |
-|--------|---------|----------|
-| **Direct** | `x-ratelimit`, `x-retry` | Simple, one pattern per operation |
-| **Namespaced** | `x-telstra.resiliency.ratelimit` | Multiple patterns, organization-wide standards |
-
----
+Define resilience patterns directly in your OpenAPI specification using `x-telstra` vendor extensions.
 
 ### Global Configuration
 
@@ -232,24 +245,15 @@ info:
   title: My Service
   version: 1.0.0
 
-# Global Failsafe configuration
-x-failsafe:
-  telemetry:
+x-telstra:
+  otel:
     enabled: true
-    type: otel
     endpoint: http://otel-collector:4318/v1/metrics
-  controlplane:
+  controller:
     enabled: true
     url: http://failsafe-controlplane:8080
   protection:
     type: ingress
-
-# Or using custom namespace
-x-telstra:
-  otel:
-    enabled: true
-  controller:
-    enabled: true
 ```
 
 ---
@@ -257,31 +261,6 @@ x-telstra:
 ### Rate Limiting
 
 Protect endpoints from excessive requests using token bucket rate limiting.
-
-#### Direct Extension (`x-ratelimit`)
-
-```yaml
-paths:
-  /products:
-    get:
-      operationId: list_products
-      x-ratelimit:
-        name: list_products
-        max_executions: 5000
-        per_time_secs: 60
-        bucket_size: 500
-        retry_after_strategy: backpressure
-        p95_baseline: 1.0
-        min_latency: 0.001
-        min_retry_delay: 0.01
-        max_retry_penalty: 1.0
-        gradient_sensitivity: 10.0
-      responses:
-        '200':
-          description: OK
-```
-
-#### Namespaced Extension (`x-telstra`)
 
 ```yaml
 paths:
@@ -292,22 +271,27 @@ paths:
         resiliency:
           ratelimit:
             enabled: true
+            name: list_products
             max_executions: 5000
             per_time_secs: 60
             bucket_size: 500
+            retry_after_strategy: backpressure
             p95_baseline: 1.0
             min_latency: 0.001
+            min_retry_delay: 0.01
+            max_retry_penalty: 1.0
+            gradient_sensitivity: 10.0
       responses:
         '200':
           description: OK
 ```
 
-#### Rate Limit Parameters
+#### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name` | `string` | `operationId` | Identifier for metrics |
 | `enabled` | `boolean` | `true` | Enable/disable rate limiting |
+| `name` | `string` | `operationId` | Identifier for metrics |
 | `max_executions` | `integer` | `100` | Requests per time window |
 | `per_time_secs` | `number` | `60` | Time window in seconds |
 | `bucket_size` | `integer` | `max_executions` | Maximum burst capacity |
@@ -330,9 +314,6 @@ paths:
     retry_after_strategy=Strategy.BACKPRESSURE,
     p95_baseline=1.0,
     min_latency=0.001,
-    min_retry_delay=0.01,
-    max_retry_penalty=1.0,
-    gradient_sensitivity=10.0,
 )
 async def list_products(request: Request) -> List[Product]:
     ...
@@ -344,30 +325,6 @@ async def list_products(request: Request) -> List[Product]:
 
 Automatically retry failed operations with exponential backoff.
 
-#### Direct Extension (`x-retry`)
-
-```yaml
-paths:
-  /orders:
-    post:
-      operationId: create_order
-      x-retry:
-        name: create_order
-        attempts: 3
-        delay: 0.5
-        backoff: 2.0
-        max_delay: 30.0
-        exceptions:
-          - ConnectionError
-          - TimeoutError
-          - HTTPStatusError
-      responses:
-        '200':
-          description: OK
-```
-
-#### Namespaced Extension
-
 ```yaml
 paths:
   /orders:
@@ -377,20 +334,25 @@ paths:
         resiliency:
           retry:
             enabled: true
+            name: create_order
             attempts: 3
             delay: 0.5
             backoff: 2.0
+            max_delay: 30.0
+            exceptions:
+              - ConnectionError
+              - TimeoutError
       responses:
         '200':
           description: OK
 ```
 
-#### Retry Parameters
+#### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name` | `string` | `operationId` | Identifier for metrics |
 | `enabled` | `boolean` | `true` | Enable/disable retry |
+| `name` | `string` | `operationId` | Identifier for metrics |
 | `attempts` | `integer` | `3` | Maximum retry attempts |
 | `delay` | `number` | `1.0` | Initial delay between retries |
 | `backoff` | `number` | `2.0` | Exponential backoff multiplier |
@@ -406,8 +368,6 @@ paths:
     attempts=3,
     delay=0.5,
     backoff=2.0,
-    max_delay=30.0,
-    exceptions=(ConnectionError, TimeoutError),
 )
 async def create_order(request: Request, order: OrderCreate) -> Order:
     ...
@@ -419,25 +379,6 @@ async def create_order(request: Request, order: OrderCreate) -> Order:
 
 Prevent cascading failures by stopping calls to failing services.
 
-#### Direct Extension (`x-circuitbreaker`)
-
-```yaml
-paths:
-  /payments:
-    post:
-      operationId: process_payment
-      x-circuitbreaker:
-        name: payment_gateway
-        failure_threshold: 5
-        recovery_timeout: 30
-        half_open_requests: 3
-      responses:
-        '200':
-          description: OK
-```
-
-#### Namespaced Extension
-
 ```yaml
 paths:
   /payments:
@@ -447,19 +388,21 @@ paths:
         resiliency:
           circuitbreaker:
             enabled: true
+            name: payment_gateway
             failure_threshold: 5
             recovery_timeout: 30
+            half_open_requests: 3
       responses:
         '200':
           description: OK
 ```
 
-#### Circuit Breaker Parameters
+#### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name` | `string` | `operationId` | Identifier for metrics |
 | `enabled` | `boolean` | `true` | Enable/disable circuit breaker |
+| `name` | `string` | `operationId` | Identifier for metrics |
 | `failure_threshold` | `integer` | `5` | Failures before opening |
 | `recovery_timeout` | `number` | `30` | Seconds before half-open |
 | `half_open_requests` | `integer` | `3` | Test requests in half-open |
@@ -472,7 +415,6 @@ paths:
     name="payment_gateway",
     failure_threshold=5,
     recovery_timeout=30,
-    half_open_requests=3,
 )
 async def process_payment(request: Request, payment: PaymentRequest) -> Payment:
     ...
@@ -484,25 +426,27 @@ async def process_payment(request: Request, payment: PaymentRequest) -> Payment:
 
 Bound execution time for operations.
 
-#### Direct Extension (`x-timeout`)
-
 ```yaml
 paths:
   /reports:
     get:
       operationId: generate_report
-      x-timeout:
-        name: report_generation
-        seconds: 30.0
+      x-telstra:
+        resiliency:
+          timeout:
+            enabled: true
+            name: report_generation
+            seconds: 30.0
       responses:
         '200':
           description: OK
 ```
 
-#### Timeout Parameters
+#### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Enable/disable timeout |
 | `name` | `string` | `operationId` | Identifier for metrics |
 | `seconds` | `number` | `30.0` | Timeout duration |
 
@@ -551,20 +495,9 @@ paths:
 
 ```python
 @router.post("/orders")
-@tokenbucket(
-    name="create_order",
-    max_executions=1000,
-    per_time_secs=60,
-)
-@circuitbreaker(
-    name="create_order_circuit",
-    failure_threshold=5,
-)
-@retry(
-    name="create_order_retry",
-    attempts=3,
-    delay=0.5,
-)
+@tokenbucket(name="create_order", max_executions=1000, per_time_secs=60)
+@circuitbreaker(name="create_order_circuit", failure_threshold=5)
+@retry(name="create_order_retry", attempts=3, delay=0.5)
 @timeout(name="create_order_timeout", seconds=10.0)
 async def create_order(request: Request, order: OrderCreate) -> Order:
     ...
@@ -580,7 +513,6 @@ info:
   title: Inventory Service
   version: 0.1.0
 
-# Global configuration
 x-telstra:
   otel:
     enabled: true
@@ -589,7 +521,6 @@ x-telstra:
 
 servers:
   - url: "http://0.0.0.0:8001"
-    description: Local development server
 
 paths:
   /inventories:
@@ -621,16 +552,17 @@ paths:
         - inventories
       summary: Create Inventory
       operationId: create_inventory
-      x-ratelimit:
-        name: create_inventory
-        max_executions: 1000
-        per_time_secs: 60
-        retry_after_strategy: backpressure
-      x-retry:
-        name: create_inventory_retry
-        attempts: 3
-        delay: 0.5
-        backoff: 2.0
+      x-telstra:
+        resiliency:
+          ratelimit:
+            enabled: true
+            max_executions: 1000
+            per_time_secs: 60
+          retry:
+            enabled: true
+            attempts: 3
+            delay: 0.5
+            backoff: 2.0
       requestBody:
         required: true
         content:
@@ -679,10 +611,12 @@ paths:
         - inventories
       summary: Delete Inventory
       operationId: delete_inventory
-      x-circuitbreaker:
-        name: inventory_delete
-        failure_threshold: 3
-        recovery_timeout: 60
+      x-telstra:
+        resiliency:
+          circuitbreaker:
+            enabled: true
+            failure_threshold: 3
+            recovery_timeout: 60
       parameters:
         - name: inventory_id
           in: path
@@ -750,12 +684,6 @@ components:
         low_stock_threshold:
           type: integer
           default: 10
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
 
     InventoryRequest:
       type: object
@@ -768,10 +696,6 @@ components:
           type: integer
           minimum: 0
           default: 0
-        low_stock_threshold:
-          type: integer
-          minimum: 0
-          default: 10
 
     StockAdjustment:
       type: object
@@ -780,336 +704,236 @@ components:
       properties:
         amount:
           type: integer
-          description: Positive to add, negative to remove
 ```
 
 ---
 
-## Generated Output
+## Resiliency Patterns
 
-### Project Structure
+All patterns support both **decorator** and **async context manager** APIs.
 
-```
-generated-service/
-├── main.py                    # FastAPI app with FailsafeController
-├── requirements.txt
-├── pyproject.toml
-├── Dockerfile
-├── .env
-├── .config/
-│   ├── otel-config.yaml       # OTEL Collector configuration
-│   └── prometheus.yml         # Prometheus scrape configuration
-└── inventory_service/
-    ├── __init__.py
-    ├── settings.py            # Pydantic settings
-    ├── apis/
-    │   ├── __init__.py
-    │   ├── inventories_api.py # Generated routes with decorators
-    │   └── products_api.py
-    └── models/
-        ├── __init__.py
-        ├── inventory.py
-        └── inventory_request.py
-```
-
-### Generated Code Examples
-
-#### `main.py`
+### Rate Limiting (Decorator)
 
 ```python
-# coding: utf-8
-"""
-Inventory Service
-
-Generated by failsafe-generator
-"""
-
-from fastapi import FastAPI
-
-from failsafe import FailsafeController, Telemetry, Protection
-
-from inventory_service.apis.inventories_api import router as InventoriesApiRouter
-from inventory_service.apis.products_api import router as ProductsApiRouter
-
-app = FastAPI(
-    title="Inventory Service",
-    description="Inventory management API",
-    version="0.1.0",
-)
-
-# Failsafe Resilience Bootstrap
-FailsafeController(app, service_name="inventory_service") \
-    .with_telemetry(
-        Telemetry.OTEL,
-        endpoint="http://otel-collector:4318/v1/metrics",
-    ) \
-    .with_protection(Protection.INGRESS) \
-    .with_controlplane(
-        url="http://failsafe-controlplane:8080",
-    )
-
-app.include_router(InventoriesApiRouter)
-app.include_router(ProductsApiRouter)
-```
-
-#### `apis/inventories_api.py`
-
-```python
-# coding: utf-8
-"""
-Inventories API
-
-Generated by failsafe-generator
-"""
-
-from typing import List
-from fastapi import APIRouter, Request, HTTPException
-
 from failsafe.ratelimit import tokenbucket, Strategy
+
+@tokenbucket(
+    name="get_product",
+    max_executions=5000,
+    per_time_secs=60,
+    bucket_size=500,
+    retry_after_strategy=Strategy.BACKPRESSURE,
+)
+async def get_product(request: Request, product_id: str):
+    return await product_service.get(product_id)
+```
+
+### Retry
+
+```python
 from failsafe.retry import retry
-from failsafe.circuitbreaker import circuitbreaker
+
+@retry(name="fetch_data", attempts=3, delay=0.5, backoff=2.0)
+async def fetch_data(url: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        return (await client.get(url)).json()
+```
+
+### Circuit Breaker
+
+```python
+from failsafe.circuitbreaker import circuitbreaker, CircuitBreakerOpen
+
+@circuitbreaker(name="payment_service", failure_threshold=5, recovery_timeout=30)
+async def process_payment(order_id: str) -> PaymentResult:
+    return await payment_gateway.charge(order_id)
+```
+
+### Timeout
+
+```python
 from failsafe.timeout import timeout
 
-from ..models import Inventory, InventoryRequest, StockAdjustment
+@timeout(name="db_query", seconds=5.0)
+async def query_database(query: str) -> list:
+    return await db.execute(query)
+```
 
-router = APIRouter(prefix="/inventories", tags=["inventories"])
+### Bulkhead
 
+```python
+from failsafe.bulkhead import bulkhead, BulkheadFull
 
-@router.get("", response_model=List[Inventory])
-@tokenbucket(
-    name="get_inventories",
-    max_executions=5000,
-    per_time_secs=60,
-    retry_after_strategy=Strategy.BACKPRESSURE,
-    p95_baseline=0.5,
-    min_latency=0.01,
-)
-async def get_inventories(request: Request) -> List[Inventory]:
-    """Get Inventories"""
-    # TODO: Implement business logic
-    raise HTTPException(status_code=501, detail="Not implemented")
+@bulkhead(name="report_generator", max_concurrent=10, max_queued=50)
+async def generate_report(report_id: str) -> Report:
+    return await heavy_computation(report_id)
+```
 
+### Fallback
 
-@router.post("", response_model=Inventory)
-@tokenbucket(
-    name="create_inventory",
-    max_executions=1000,
-    per_time_secs=60,
-    retry_after_strategy=Strategy.BACKPRESSURE,
-)
-@retry(
-    name="create_inventory_retry",
-    attempts=3,
-    delay=0.5,
-    backoff=2.0,
-)
-async def create_inventory(
-    request: Request,
-    inventory_request: InventoryRequest,
-) -> Inventory:
-    """Create Inventory"""
-    # TODO: Implement business logic
-    raise HTTPException(status_code=501, detail="Not implemented")
+```python
+from failsafe.fallback import fallback
 
+async def get_cached_price(product_id: str) -> float:
+    return await cache.get(f"price:{product_id}") or 0.0
 
-@router.get("/{inventory_id}", response_model=Inventory)
-@tokenbucket(
-    name="get_inventory",
-    max_executions=5000,
-    per_time_secs=60,
-    retry_after_strategy=Strategy.BACKPRESSURE,
-)
-@timeout(name="get_inventory_timeout", seconds=5.0)
-async def get_inventory(
-    request: Request,
-    inventory_id: str,
-) -> Inventory:
-    """Get Inventory"""
-    # TODO: Implement business logic
-    raise HTTPException(status_code=501, detail="Not implemented")
+@fallback(name="pricing", fallback_fn=get_cached_price)
+async def get_live_price(product_id: str) -> float:
+    return await pricing_service.get_price(product_id)
+```
 
+### Hedge
 
-@router.delete("/{inventory_id}")
-@circuitbreaker(
-    name="inventory_delete",
-    failure_threshold=3,
-    recovery_timeout=60,
-)
-async def delete_inventory(
-    request: Request,
-    inventory_id: str,
-):
-    """Delete Inventory"""
-    # TODO: Implement business logic
-    raise HTTPException(status_code=501, detail="Not implemented")
+```python
+from failsafe.hedge import hedge
 
+@hedge(name="price_quote", attempts=3, delay=0.03, timeout=0.25)
+async def get_price(venue: str) -> float:
+    return await venue_api.fetch_price(venue)
+```
 
-@router.post("/{inventory_id}/stock", response_model=Inventory)
-@tokenbucket(
-    name="adjust_stock",
-    max_executions=2000,
-    per_time_secs=60,
-    retry_after_strategy=Strategy.BACKPRESSURE,
-    p95_baseline=0.2,
-    min_latency=0.05,
-)
-@retry(
-    name="adjust_stock_retry",
-    attempts=3,
-    delay=1.0,
-)
-async def adjust_stock(
-    request: Request,
-    inventory_id: str,
-    stock_adjustment: StockAdjustment,
-) -> Inventory:
-    """Adjust Stock"""
-    # TODO: Implement business logic
-    raise HTTPException(status_code=501, detail="Not implemented")
+### Fail Fast
+
+```python
+from failsafe.failfast import failfast, FailFastOpen
+
+@failfast(name="orders_write", failure_threshold=3)
+async def create_order(order: Order) -> OrderResult:
+    return await order_service.create(order)
+```
+
+### Feature Toggle
+
+```python
+from failsafe.featuretoggle import featuretoggle, FeatureDisabled
+
+@featuretoggle(name="new_checkout", enabled=False)
+async def checkout_v2(cart: Cart) -> CheckoutResult:
+    return await new_checkout_service.process(cart)
+```
+
+### Cache
+
+```python
+from failsafe.cache import cache
+
+@cache(name="user_profile", ttl=300, max_size=1000)
+async def get_user_profile(user_id: str) -> UserProfile:
+    return await user_service.fetch_profile(user_id)
 ```
 
 ---
 
-## Configuration Files
+## FastAPI Integration
 
-### `.env`
+### Bootstrap
 
-```bash
-SERVICE_NAME=inventory-service
-OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318/v1/metrics
-FAILSAFE_CONTROLPLANE_URL=http://failsafe-controlplane:8080
-FAILSAFE_ENABLED=true
+```python
+from fastapi import FastAPI
+from failsafe import FailsafeController, Telemetry, Protection
+
+app = FastAPI(title="My Service")
+
+FailsafeController(app) \
+    .with_telemetry(Telemetry.OTEL) \
+    .with_protection(Protection.INGRESS) \
+    .with_controlplane()
 ```
 
-### `.config/otel-config.yaml`
+This single chain:
+- Sets up OpenTelemetry metrics export
+- Registers exception handlers (429, 503, 504)
+- Adds `RateLimit-*` headers middleware
+- Enables control plane for dynamic config
 
-```yaml
-receivers:
-  otlp:
-    protocols:
-      http:
-        endpoint: 0.0.0.0:4318
+---
 
-processors:
-  batch:
+## Adaptive Clients
 
-exporters:
-  prometheus:
-    endpoint: "0.0.0.0:8889"
+Create self-regulating clients that respect server backpressure:
 
-service:
-  pipelines:
-    metrics:
-      receivers: [otlp]
-      processors: [batch]
-      exporters: [prometheus]
-```
+```python
+from failsafe.client import EnhancedClientInterface, adaptive
 
-### `.config/prometheus.yml`
 
-```yaml
-global:
-  scrape_interval: 15s
+class ProductClient(EnhancedClientInterface):
+    
+    @adaptive(strategy="queue", max_retries=3)
+    def create_product(self, data: ProductRequest) -> ProductResponse:
+        return ProductResponse.parse_obj(
+            self.send_request(
+                method="POST",
+                endpoint="/products",
+                json=data.model_dump()
+            )
+        )
 
-scrape_configs:
-  - job_name: 'otel-collector'
-    static_configs:
-      - targets: ['otel-collector:8889']
-  
-  - job_name: 'inventory-service'
-    static_configs:
-      - targets: ['inventory-service:8000']
+
+client = ProductClient(base_url="http://product-service:8000")
+product = client.create_product(ProductRequest(name="Widget", price=29.99))
 ```
 
 ---
 
-## Environment Variables
+## Observability
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SERVICE_NAME` | App title | Service identifier |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318/v1/metrics` | OTLP endpoint |
-| `OTEL_SERVICE_NAME` | `SERVICE_NAME` | OTEL service name |
-| `FAILSAFE_CONTROLPLANE_URL` | `http://localhost:8080` | Control plane URL |
-| `FAILSAFE_ENABLED` | `true` | Enable/disable Failsafe |
+### OpenTelemetry Integration
+
+Configured automatically with `FailsafeController.with_telemetry(Telemetry.OTEL)`, or manually:
+
+```python
+from failsafe.integrations.opentelemetry import FailsafeOtelInstrumentor
+
+FailsafeOtelInstrumentor().instrument(
+    namespace="failsafe.my_service",
+    meter_provider=meter_provider,
+)
+```
+
+### Prometheus Metrics
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `failsafe_ratelimit_requests_total` | `pattern`, `status` | Total requests |
+| `failsafe_ratelimit_tokens_available` | `pattern` | Current tokens |
+| `failsafe_ratelimit_backpressure_score` | `pattern` | Stress level (0-1) |
+| `failsafe_ratelimit_request_latency_seconds` | `pattern` | Request latencies |
 
 ---
 
-## Docker Support
+## How It Works
 
-### Generated Dockerfile
+### Token Bucket + Backpressure
 
-```dockerfile
-FROM python:3.12-slim
+Token bucket rate limiting works by refilling tokens at a steady rate and consuming one per request. When the bucket empties, requests are rejected with a `Retry-After` header calculated by the backpressure system, which monitors the P95 latency sliding window and latency gradient to determine system stress — returning shorter waits when healthy and longer waits when response times are degrading.
 
-WORKDIR /app
+### Formulas
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+**Backpressure Score:**
+$$
+b = \max(b_{p95}, b_{grad}) \quad \text{where} \quad b \in [0, 1]
+$$
 
-COPY . .
+**Retry-After Calculation:**
+$$
+t_{retry} = (t_{min} + t_{max} \times b) \times j \quad \text{where} \quad j \sim \mathcal{U}(0.8, 1.2)
+$$
 
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-### Build and Run
-
-```bash
-# Build
-docker build -t inventory-service:latest .
-
-# Run
-docker run -p 8000:8000 \
-  -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318/v1/metrics \
-  inventory-service:latest
-```
-
-### Docker Compose
-
-```yaml
-version: '3.8'
-
-services:
-  inventory-service:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - SERVICE_NAME=inventory-service
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318/v1/metrics
-      - FAILSAFE_CONTROLPLANE_URL=http://controlplane:8080
-    depends_on:
-      - otel-collector
-
-  otel-collector:
-    image: otel/opentelemetry-collector:latest
-    volumes:
-      - ./.config/otel-config.yaml:/etc/otel-config.yaml
-    command: ["--config", "/etc/otel-config.yaml"]
-    ports:
-      - "4318:4318"
-      - "8889:8889"
-
-  prometheus:
-    image: prom/prometheus:latest
-    volumes:
-      - ./.config/prometheus.yml:/etc/prometheus/prometheus.yml
-    ports:
-      - "9090:9090"
-```
+**Refill Rate:**
+$$
+r = \frac{E_{max}}{T} \quad \text{tokens/second}
+$$
 
 ---
 
 ## Acknowledgements
 
-- [openapi-generator](https://github.com/OpenAPITools/openapi-generator) — Core code generation
 - [failsafe-lib/failsafe](https://github.com/failsafe-lib/failsafe) — Java resilience patterns inspiration
+- [openapi-generator](https://github.com/OpenAPITools/openapi-generator) — Code generation
 - [FastAPI](https://fastapi.tiangolo.com/) — Modern Python web framework
 
 ---
 
 <p align="center">
-  <em>From spec to resilient service — resilience-as-code, automated.</em>
+  <em>Resilience-as-code: generate self-protecting services and self-regulating clients from your API spec.</em>
 </p>

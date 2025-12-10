@@ -29,7 +29,7 @@ FailsafeController(app, service_name="{{packageName}}"){{#otel}} \
     ){{/otel}}{{#protection}} \
     .with_protection(Protection.{{protectionType}}{{^protectionType}}INGRESS{{/protectionType}}){{/protection}}{{#controlplane}} \
     .with_controlplane(
-        url="{{controlplaneUrl}}{{^controlplaneUrl}}http://failsafe-controlplane:8080{{/controlplaneUrl}}",
+        url="{{controlplanePrefix}}{{^controlplanePrefix}}/failsafe{{/controlplanePrefix}}",
     ){{/controlplane}}
 
 

@@ -8,6 +8,7 @@
 
 <p align="center">
     <a href="#installation">Installation</a> •
+    <a href="#autogen-service-protection">AutoGen Service Protection</a> •
     <a href="#quick-start">Quick Start</a> •
     <a href="#rate-limiting">Rate Limiting</a> •
     <a href="#adaptive-clients">Adaptive Clients</a> •
@@ -29,6 +30,7 @@ Inspired by [Failsafe (Java)](https://github.com/failsafe-lib/failsafe), with fi
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [AutoGen Service Protection](#autogen-service-protection)
 - [Rate Limiting](#rate-limiting)
   - [Token Bucket Basics](#token-bucket-basics)
   - [Configuration Reference](#token-bucket-configuration)
@@ -47,6 +49,7 @@ Inspired by [Failsafe (Java)](https://github.com/failsafe-lib/failsafe), with fi
   - [Cache](#cache)
 - [FastAPI Integration](#fastapi-integration)
   - [Bootstrap](#bootstrap)
+  - [Control Plane](#control-plane)
   - [Exception Handlers](#exception-handlers)
   - [Middleware](#middleware)
 - [OpenAPI Vendor Extensions](#openapi-vendor-extensions)
@@ -64,6 +67,7 @@ Inspired by [Failsafe (Java)](https://github.com/failsafe-lib/failsafe), with fi
 - **Decorator & Context Manager APIs** — Clean, Pythonic interfaces
 - **Self-regulating systems** — Services and clients cooperate via backpressure signals
 - **Adaptive rate limiting** — Dynamic `Retry-After` based on real-time system health
+- **Embedded control plane** — Runtime configuration and pattern management via REST APIs
 - **OpenTelemetry & Prometheus** — Built-in observability for every pattern
 - **OpenAPI integration** — Define resilience in your API spec, generate protected services
 - **Zero boilerplate** — One decorator, production-grade protection
@@ -114,6 +118,31 @@ That's it. Your endpoint now:
 - Includes `Retry-After` header telling clients when to retry
 
 ---
+
+## AutoGen Service Protection
+
+Failsafe can automatically generate and apply resilience patterns based on OpenAPI specifications using `x-telstra` vendor extensions.
+
+```yaml
+paths:
+  /products/{product_id}:
+    get:
+      operationId: get_product
+      x-telstra:
+        resiliency:
+          ratelimit:
+            enabled: true
+            name: get_product
+            max_executions: 1000
+            per_time_secs: 60
+      responses:
+        '200':
+          description: OK
+```
+
+For more details see [Failsafe Generator](./failsafe/generator/README.md)
+---
+
 
 ## Rate Limiting
 
@@ -354,54 +383,204 @@ A rate-limited server returns `Retry-After: 2` but badly-behaved clients ignore 
 
 ### The Solution
 
-The `@adaptive` decorator creates self-regulating clients that respect server signals:
+Failsafe provides two approaches to building self-regulating clients:
+
+1. **`AdaptiveClient` base class** — Inherit for full-featured HTTP clients
+2. **`@adaptive` decorator** — Wrap individual methods or standalone functions
+
+---
+
+### Basic AdaptiveClient
 
 ```python
-from failsafe.client import EnhancedClientInterface, adaptive
+from failsafe.client import AdaptiveClient
 
-
-class ProductClient(EnhancedClientInterface):
-    """Self-regulating client that respects backpressure signals."""
+class ProductClient(AdaptiveClient):
+    """Simple client using base class behavior."""
     
-    @adaptive(strategy="queue", max_retries=3)
-    def create_product(self, data: ProductRequest) -> ProductResponse:
-        return ProductResponse.parse_obj(
-            self.send_request(
-                method="POST",
-                endpoint="/products",
-                json=data.model_dump()
-            )
-        )
+    def get_product(self, product_id: str) -> dict:
+        return self.send_request("GET", f"/products/{product_id}")
     
-    @adaptive(strategy="reject")
-    def get_product(self, product_id: str) -> ProductResponse:
-        return ProductResponse.parse_obj(
-            self.send_request(
-                method="GET",
-                endpoint=f"/products/{product_id}"
-            )
-        )
+    def list_products(self) -> list:
+        return self.send_request("GET", "/products")
 
 
 # Usage
-client = ProductClient(base_url="http://product-service:8000")
-product = client.create_product(ProductRequest(name="Widget", price=29.99))
+client = ProductClient(
+    base_url="http://product-service:8000",
+    adaptive=True,
+    strategy="queue",
+    max_retries=3,
+)
+product = client.get_product("123")
 ```
+
+---
+
+### @adaptive Decorator
+
+Override settings per-method, or use on standalone functions:
+
+```python
+from failsafe.client import AdaptiveClient, adaptive, RateLimitedError, MaxRetriesExceeded
+from pydantic import BaseModel
+
+
+class ProductRequest(BaseModel):
+    name: str
+    price: float
+
+
+class ProductResponse(BaseModel):
+    id: str
+    name: str
+    price: float
+
+
+class ProductClient(AdaptiveClient):
+    """Client with per-method adaptive configuration."""
+    
+    @adaptive(strategy="queue", max_retries=5, backoff_multiplier=1.5)
+    def create_product(self, data: ProductRequest) -> ProductResponse:
+        """More retries for writes."""
+        result = self.send_request("POST", "/products", **data.model_dump())
+        return ProductResponse.model_validate(result)
+    
+    @adaptive(strategy="reject")
+    def get_product(self, product_id: str) -> ProductResponse:
+        """Fail fast for reads."""
+        result = self.send_request("GET", f"/products/{product_id}")
+        return ProductResponse.model_validate(result)
+    
+    @adaptive(strategy="queue", max_retries=3, respect_backpressure=True)
+    def update_product(self, product_id: str, data: ProductRequest) -> ProductResponse:
+        """Standard retry with backpressure awareness."""
+        result = self.send_request("PUT", f"/products/{product_id}", **data.model_dump())
+        return ProductResponse.model_validate(result)
+```
+
+---
+
+### Standalone @adaptive (No Base Class)
+
+```python
+import httpx
+from failsafe.client import adaptive
+
+@adaptive(strategy="queue", max_retries=3, name="external_api")
+def call_external_api(endpoint: str) -> dict:
+    """Standalone function with adaptive retry."""
+    with httpx.Client() as client:
+        response = client.get(f"https://api.example.com{endpoint}")
+        response.raise_for_status()
+        return response.json()
+
+
+@adaptive(strategy="queue", max_retries=3)
+async def call_external_api_async(endpoint: str) -> dict:
+    """Async standalone function."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"https://api.example.com{endpoint}")
+        response.raise_for_status()
+        return response.json()
+```
+
+---
+
+### Decorator Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `strategy` | `"queue" \| "reject"` | `"queue"` | Wait and retry, or fail immediately |
+| `max_retries` | `int` | `3` | Maximum retry attempts |
+| `name` | `str` | Function name | Identifier for state tracking |
+| `backoff_multiplier` | `float` | `1.0` | Multiply wait time on each retry |
+| `max_wait` | `float` | `60.0` | Maximum wait per retry (seconds) |
+| `respect_backpressure` | `bool` | `True` | Proactively slow down on high backpressure |
+| `backpressure_threshold` | `float` | `0.8` | Backpressure level to trigger slowdown |
+
+---
 
 ### Strategies
 
 | Strategy | Behavior |
 |----------|----------|
-| `"queue"` | Wait for `Retry-After` duration, then automatically retry |
+| `"queue"` | Wait for `Retry-After` duration, then retry (up to `max_retries`) |
 | `"reject"` | Immediately raise `RateLimitedError` with wait time |
+
+---
+
+### Error Handling
+
+```python
+from failsafe.client import RateLimitedError, MaxRetriesExceeded
+
+client = ProductClient(base_url="http://product-service:8000")
+
+try:
+    product = client.create_product(ProductRequest(name="Widget", price=29.99))
+    
+except RateLimitedError as e:
+    # Raised when strategy="reject"
+    print(f"Rate limited! Retry after {e.retry_after:.2f}s")
+    print(f"Server backpressure: {e.backpressure:.2%}")
+    
+except MaxRetriesExceeded as e:
+    # Raised when strategy="queue" and all retries exhausted
+    print(f"Failed after {e.attempts} attempts")
+    print(f"Last Retry-After was {e.last_retry_after:.2f}s")
+```
+
+---
+
+### Checking Client State
+
+```python
+client = ProductClient(base_url="http://product-service:8000")
+
+# Check if currently rate limited
+if client.is_rate_limited:
+    print(f"Rate limited. Wait {client.retry_after_seconds:.2f}s")
+
+# Check server backpressure (0.0-1.0)
+if client.backpressure > 0.8:
+    print(f"High backpressure ({client.backpressure:.2%}), slowing down")
+
+# Check remaining tokens
+if client.remaining_tokens is not None and client.remaining_tokens < 10:
+    print(f"Only {client.remaining_tokens} tokens left!")
+```
+
+---
 
 ### What the Client Reads
 
 | Header | Purpose |
 |--------|---------|
 | `Retry-After` | Seconds to wait before retrying |
-| `X-Backpressure` | System stress level (0.0-1.0) — slow down proactively |
+| `X-RateLimit-Retry-After-Ms` | Precise milliseconds (if available) |
+| `X-Backpressure` | Server stress level (0.0-1.0) — slow down proactively |
 | `RateLimit-Remaining` | Tokens left — stop before hitting limit |
+
+---
+
+### Dynamic Configuration
+
+```python
+client = ProductClient(base_url="http://product-service:8000")
+
+# Switch to reject mode for time-sensitive operations
+client.set_strategy("reject")
+
+try:
+    product = client.get_product("123")
+except RateLimitedError:
+    print("Can't wait, failing fast")
+
+# Switch back to queue mode with more retries
+client.set_strategy("queue")
+client.set_max_retries(5)
+```
 
 ---
 
@@ -616,16 +795,16 @@ Full resilience setup in one place:
 
 ```python
 from fastapi import FastAPI, Request, HTTPException
-from failsafe.integrations.fastapi import FailsafeController
-from failsafe.ratelimit import tokenbucket
-from failsafe import Strategy, Telemetry, Protection
+from failsafe import FailsafeController, Telemetry, Protection
+from failsafe.ratelimit import tokenbucket, Strategy
 
 app = FastAPI(title="Product Service", version="1.0.0")
 
 # One-line resilience setup
 FailsafeController(app) \
     .with_telemetry(Telemetry.OTEL) \
-    .with_protection(Protection.INGRESS)
+    .with_protection(Protection.INGRESS) \
+    .with_controlplane()
 
 
 @app.get("/products/{product_id}")
@@ -638,17 +817,115 @@ FailsafeController(app) \
 )
 async def get_product(request: Request, product_id: str):
     return await product_service.get(product_id)
+```
 
+This single chain:
+- Sets up OpenTelemetry metrics export
+- Registers all exception handlers (429, 503, 504)
+- Adds `RateLimit-*` headers middleware
+- Mounts control plane REST APIs at `/failsafe/*`
 
-@app.post("/products")
-@tokenbucket(
-    name="create_product",
-    max_executions=1000,
-    per_time_secs=60,
-    retry_after_strategy=Strategy.BACKPRESSURE,
-)
-async def create_product(request: Request, product: ProductCreate):
-    return await product_service.create(product)
+---
+
+### Control Plane
+
+The `.with_controlplane()` method mounts REST APIs directly on your FastAPI app for runtime management of all registered patterns. The control plane **lives in your service** — no external dependencies.
+
+```python
+FailsafeController(app) \
+    .with_controlplane(
+        prefix="/failsafe",       # URL prefix (default: /failsafe)
+        enable_metrics=True,      # Enable metrics endpoints
+        enable_control=True,      # Enable config update endpoints
+    )
+```
+
+#### Control Plane Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/failsafe/health` | GET | Health check with active pattern count |
+| `/failsafe/liveness` | GET | Simple liveness probe |
+| `/failsafe/patterns` | GET | List all registered patterns |
+| `/failsafe/config` | GET | Get all configurations |
+| `/failsafe/config/{type}/{name}` | GET | Get config for a specific pattern |
+| `/failsafe/config/{type}/{name}` | PUT | Update pattern config at runtime |
+| `/failsafe/metrics` | GET | Get all pattern metrics |
+| `/failsafe/metrics/{type}/{name}` | GET | Get metrics for a specific pattern |
+| `/failsafe/metrics/{type}/{name}` | DELETE | Reset metrics for a pattern |
+| `/failsafe/control/{type}/{name}/enable` | POST | Enable a pattern |
+| `/failsafe/control/{type}/{name}/disable` | POST | Disable a pattern |
+
+#### Example: Update Rate Limit at Runtime
+
+```bash
+# Get current config
+curl http://localhost:8000/failsafe/config/ratelimit/get_product
+
+# Update max_executions dynamically
+curl -X PUT http://localhost:8000/failsafe/config/ratelimit/get_product \
+  -H "Content-Type: application/json" \
+  -d '{"max_executions": 10000, "per_time_secs": 60}'
+
+# Disable rate limiting temporarily
+curl -X POST http://localhost:8000/failsafe/control/ratelimit/get_product/disable
+```
+
+#### Example: Query Metrics
+
+```bash
+# Get all metrics
+curl http://localhost:8000/failsafe/metrics
+
+# Get metrics for specific pattern
+curl http://localhost:8000/failsafe/metrics/ratelimit/get_product
+
+# Response:
+{
+  "pattern_type": "ratelimit",
+  "name": "get_product",
+  "metrics": {
+    "requests": 15234,
+    "throttled": 127,
+    "tokens_available": 487,
+    "last_updated": "2025-01-15T10:30:00Z"
+  },
+  "timestamp": "2025-01-15T10:30:05Z"
+}
+```
+
+#### YAML Configuration
+
+Load default configurations from `failsafe.yaml`:
+
+```yaml
+# failsafe.yaml
+ratelimit:
+  get_product:
+    max_executions: 5000
+    per_time_secs: 60
+    bucket_size: 500
+  
+  default:
+    max_executions: 1000
+    per_time_secs: 60
+
+retry:
+  default:
+    attempts: 3
+    backoff: 0.5
+
+circuitbreaker:
+  payment_service:
+    failure_threshold: 5
+    recovery_timeout: 30
+```
+
+```python
+from pathlib import Path
+
+FailsafeController(app, config_path=Path("failsafe.yaml")) \
+    .with_controlplane()
 ```
 
 ---
@@ -718,24 +995,27 @@ This adds headers to successful responses:
 
 ## OpenAPI Vendor Extensions
 
-Define resilience patterns in your OpenAPI specification, then generate protected services automatically with [failsafe-generator](https://github.com/yourorg/failsafe-generator).
+Define resilience patterns in your OpenAPI specification using `x-telstra` vendor extensions, then generate protected services automatically.
 
-### Rate Limiting (`x-ratelimit`)
+### Rate Limiting
 
 ```yaml
 paths:
   /products:
     get:
       operationId: list_products
-      x-ratelimit:
-        name: list_products
-        max_executions: 5000
-        per_time_secs: 60
-        bucket_size: 500
-        retry_after_strategy: backpressure
-        p95_baseline: 1.0
-        min_retry_delay: 0.01
-        max_retry_penalty: 1.0
+      x-telstra:
+        resiliency:
+          ratelimit:
+            enabled: true
+            name: list_products
+            max_executions: 5000
+            per_time_secs: 60
+            bucket_size: 500
+            retry_after_strategy: backpressure
+            p95_baseline: 1.0
+            min_retry_delay: 0.01
+            max_retry_penalty: 1.0
       responses:
         '200':
           description: OK
@@ -759,21 +1039,24 @@ async def list_products(request: Request):
     ...
 ```
 
-### Retry (`x-retry`)
+### Retry
 
 ```yaml
 paths:
   /orders:
     post:
       operationId: create_order
-      x-retry:
-        name: create_order_retry
-        attempts: 3
-        delay: 0.5
-        backoff: 2.0
-        exceptions:
-          - ConnectionError
-          - TimeoutError
+      x-telstra:
+        resiliency:
+          retry:
+            enabled: true
+            name: create_order_retry
+            attempts: 3
+            delay: 0.5
+            backoff: 2.0
+            exceptions:
+              - ConnectionError
+              - TimeoutError
       responses:
         '200':
           description: OK
@@ -794,17 +1077,20 @@ async def create_order(request: Request, order: OrderCreate):
     ...
 ```
 
-### Circuit Breaker (`x-circuitbreaker`)
+### Circuit Breaker
 
 ```yaml
 paths:
   /payments:
     post:
       operationId: process_payment
-      x-circuitbreaker:
-        name: payment_circuit
-        failure_threshold: 5
-        recovery_timeout: 30
+      x-telstra:
+        resiliency:
+          circuitbreaker:
+            enabled: true
+            name: payment_circuit
+            failure_threshold: 5
+            recovery_timeout: 30
       responses:
         '200':
           description: OK
@@ -992,6 +1278,25 @@ System finds equilibrium
 
 ## Legend
 
+| Symbol | Python Variable | Description |
+|--------|-----------------|-------------|
+| $b$ | `backpressure` | Combined backpressure score |
+| $b_{p95}$ | `p95_component` | P95 violation ratio |
+| $b_{grad}$ | `gradient_component` | Latency gradient ratio |
+| $t_{retry}$ | `retry_after` | Seconds to wait before retry |
+| $t_{min}$ | `min_retry_delay` | Minimum wait time |
+| $t_{max}$ | `max_retry_penalty` | Maximum additional penalty |
+| $j$ | `jitter` | Random multiplier (0.8–1.2) |
+| $r$ | `refill_rate` | Tokens added per second |
+| $E_{max}$ | `max_executions` | Requests per time window |
+| $T$ | `per_time_secs` | Time window in seconds |
+| $W$ | `window` | Latency sliding window |
+| $L_{baseline}$ | `p95_baseline` | Target P95 latency |
+| $L_{min}$ | `min_latency` | Minimum expected latency |
+| $S$ | `gradient_sensitivity` | Gradient dampening factor |
+| $\bar{L}$ | `avg_latency` | Mean of recent latencies |
+
+---
 
 ## Acknowledgements
 
